@@ -1,0 +1,3 @@
+name: 记忆模式
+description: 工作区记忆：跨会话状态恢复 + 项目知识库（.dsh/memory），memory_recall / memory_update 工具
+order: 5

@@ -1,0 +1,9 @@
+# One package: the workspace-memory plugin. Install it into a dsh profile
+# (`dsh plugin --profile <name> add link:...`), or compose it from an agent
+# preset. The patch layer below inserts the single plugin row that mounts the
+# host side (memory directory under {projectRoot}/.dsh/memory, session-boundary
+# injection, memory_recall / memory_update tools).
+
+- insert:
+    - id: dsh-memory
+      name: '@linxin666/dsh-memory'
