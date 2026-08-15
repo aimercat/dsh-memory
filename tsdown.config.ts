@@ -1,7 +1,7 @@
 import { defineConfig } from 'tsdown'
 
 export default defineConfig({
-  name: '@linxin666/dsh-memory',
+  name: '@aimercat/dsh-memory',
   entry: ['src/index.ts', 'src/invariant.ts'],
   outDir: 'lib',
   format: ['esm'],

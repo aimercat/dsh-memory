@@ -1,5 +1,5 @@
 {
-  "name": "@linxin666/dsh-memory",
+  "name": "@aimercat/dsh-memory",
   "description": "Workspace memory for DeepSeek Harness: cross-session state recovery and a project knowledge base under .dsh/memory, with session-boundary injection and memory-recall / memory-update tools.",
   "version": "0.1.0",
   "type": "module",

@@ -34,7 +34,7 @@
 # `maxBytes` bounds the injected digest; `maxIndexLines`/`maxIndexBytes` cap
 # the pointer index (Claude Code MEMORY.md pattern).
 - id: dsh-memory
-  name: '@linxin666/dsh-memory'
+  name: '@aimercat/dsh-memory'
   config:
     maxBytes: 8192
     toolsEnabled: true
