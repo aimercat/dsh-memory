@@ -38,7 +38,7 @@ Harness 新会话默认是"白纸"——除 AGENTS.md 与会话历史外，工�
 
 ```bash
 # 作为插件装入 profile（与 dsh-web-ui 插件同一机制）
-dsh plugin --profile <name> add link:G:\CodeRep\dsh_memory_support
+dsh plugin --profile <name> add link:<本仓库路径>
 ```
 
 或通过本仓库提供的 Agent preset「记忆模式」直接组装（见下）。
@@ -52,8 +52,8 @@ dsh plugin --profile <name> add link:G:\CodeRep\dsh_memory_support
 # 复制到用户预设目录
 cp -r preset/memory ~/.dsh/.agent-presets/memory
 
-# 或直接链接（开发迭代推荐）
-New-Item -ItemType Junction -Path "$env:USERPROFILE\.dsh\.agent-presets\memory" -Target "G:\CodeRep\dsh_memory_support\preset\memory"
+# 或直接链接（开发迭代推荐，<repo-path> 替换为本仓库路径）
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.dsh\.agent-presets\memory" -Target "<repo-path>\preset\memory"
 ```
 
 新建会话时选择「记忆模式」预设即可。
