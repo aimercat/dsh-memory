@@ -49,11 +49,10 @@ dsh plugin --profile <name> add link:<本仓库路径>
 组装了本插件 + 标准工具集。安装：
 
 ```bash
-# 复制到用户预设目录
-cp -r preset/memory ~/.dsh/.agent-presets/memory
-
-# 或直接链接（开发迭代推荐，<repo-path> 替换为本仓库路径）
-New-Item -ItemType Junction -Path "$env:USERPROFILE\.dsh\.agent-presets\memory" -Target "<repo-path>\preset\memory"
+# 复制到用户预设目录（<repo-path> 替换为本仓库路径）
+# 注意：必须复制而非链接 —— Windows Junction 对 agent-presets 发现不可见
+# （Dirent.isDirectory() 对 junction 返回 false），链接的 preset 不会出现在列表
+Copy-Item "<repo-path>\preset\memory" "$env:USERPROFILE\.dsh\.agent-presets\memory" -Recurse -Force
 ```
 
 新建会话时选择「记忆模式」预设即可。
