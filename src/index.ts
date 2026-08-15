@@ -1,24 +1,32 @@
 /**
  * @deepseek-ai/dsh-memory — workspace memory for DeepSeek Harness.
  *
- * Cross-session memory lives under `{projectRoot}/.dsh/memory/`:
+ * Cross-session memory lives under `{projectRoot}/.dsh/memory/`, following
+ * the Claude Code Auto Memory skeleton with harness-specific adaptations:
  *
- * - `current.md`   — current progress overview (@agent lines, stage states)
- * - `last.md`      — last-session end state (time, stage, operation, files,
- *                    pending items, key decisions, staged experience)
- * - `decisions.md` — architecture decisions (what the project is like)
- * - `patterns.md`  — code patterns and project conventions
- * - `troubleshooting.md` — debugging experience and known pitfalls
- * - `index.md`     — progressive index of the memory files
+ * - `index.md`          — pointer-style index (one pointer line per entry,
+ *                         hard-capped by lines AND bytes)
+ * - `state.md`          — single state file: current progress + last-session
+ *                         state + staged-experience (confirmation) section
+ * - `decisions.md`      — architecture decisions
+ * - `patterns.md`       — code patterns and project conventions
+ * - `troubleshooting.md`— debugging experience and known pitfalls
+ * - `user.md`           — user preferences and working style
  *
- * The plugin does two things:
- *
- * 1. Session-boundary injection: on every `agent/pre-step`, compose a bounded
- *    memory context (last state + index digest) and fold it into the step's
- *    message batch, exactly like `dsh-agent-instructions` does for AGENTS.md.
- * 2. Model-facing tools: `memory_recall` (progressive lookup) and
- *    `memory_update` (append an entry and refresh the index), so the agent
- *    persists experience across sessions.
+ * Design (from docs/方案选型分析-推荐.md):
+ * - pointer-style index: the model only sees index pointers + state digest;
+ *   details live in topic files read on demand (Claude Code MEMORY.md pattern)
+ * - hard boundary: index is capped (default 200 lines / 25 KB); over the cap
+ *   the injected block carries a WARNING instead of silently truncating
+ * - session-boundary injection: on every `agent/pre-step`, fold the memory
+ *   digest into the step's message batch (aligned with agent-instructions)
+ * - write paths: `memory_update` (4 knowledge categories) + `memory_state`
+ *   (state.md incl. staged experience) + turn-end reminder nudging the agent
+ * - experience-confirmation flow: after non-trivial work the agent stages an
+ *   experience entry in state.md; the next session surfaces it for user
+ *   confirmation before archiving into a knowledge file
+ * - retrieval: progressive (index digest → category file → raw path) plus a
+ *   keyword grep search; no vector stack
  *
  * Both halves are pure host-side: no client bundle, no web routes.
  *
@@ -36,33 +44,23 @@ export const name = 'memory'
 /** The tool registry must exist before tool registration. */
 export const inject = ['tools']
 
-/** Category files (state + knowledge). */
-export const MEMORY_FILES = [
-  'current.md',
-  'last.md',
+/** Knowledge category files (writable through memory_update). */
+export const KNOWLEDGE_FILES = [
   'decisions.md',
   'patterns.md',
   'troubleshooting.md',
+  'user.md',
 ] as const
 
-/** Knowledge categories writable through memory_update. */
-export const KNOWLEDGE_CATEGORIES = ['decisions', 'patterns', 'troubleshooting'] as const
+/** The single state file (progress + last state + staged experience). */
+export const STATE_FILE = 'state.md'
 
-/** One row of the index digest. */
-export interface MemoryIndexRow {
-  file: string
-  summary: string
-}
+/** The pointer-style index file. */
+export const INDEX_FILE = 'index.md'
 
-/** The composed memory context handed to the model. */
-export interface MemoryContext {
-  /** Digest of the memory index (per-file summaries). */
-  index: MemoryIndexRow[]
-  /** The last-session state file content, when present. */
-  last?: string
-  /** Byte budget actually applied. */
-  budget: number
-}
+/** Default hard caps for the injected index block (Claude Code MEMORY.md pattern). */
+export const DEFAULT_MAX_INDEX_LINES = 200
+export const DEFAULT_MAX_INDEX_BYTES = 25_000
 
 /** Model-facing memory plugin configuration. */
 export interface Config {
@@ -70,12 +68,39 @@ export interface Config {
   maxBytes: number
   /** Whether the memory tools are registered. */
   toolsEnabled: boolean
+  /** Hard cap on injected index lines (Claude Code MEMORY.md pattern). */
+  maxIndexLines: number
+  /** Hard cap on injected index bytes. */
+  maxIndexBytes: number
+  /** Whether a turn-end reminder nudges the agent to persist memory. */
+  turnEndReminder: boolean
 }
 
 /** Schemastery-style config object (plain shape for the loader). */
 export const Config = {
   maxBytes: 8192,
   toolsEnabled: true,
+  maxIndexLines: DEFAULT_MAX_INDEX_LINES,
+  maxIndexBytes: DEFAULT_MAX_INDEX_BYTES,
+  turnEndReminder: true,
+}
+
+/** One pointer row of the index digest. */
+export interface MemoryIndexRow {
+  file: string
+  summary: string
+}
+
+/** The composed memory context handed to the model. */
+export interface MemoryContext {
+  /** Pointer-style index rows (file → summary). */
+  index: MemoryIndexRow[]
+  /** The state file digest, when present. */
+  state?: string
+  /** Whether the index exceeded the hard cap (injection carries a WARNING). */
+  indexOverCap: boolean
+  /** Byte budget actually applied. */
+  budget: number
 }
 
 /** Resolve the memory directory for a session cwd: `{projectRoot}/.dsh/memory`. */
@@ -89,8 +114,8 @@ async function findProjectRoot(cwd: string): Promise<string> {
   let current = cwd
   for (let depth = 0; depth < 64; depth += 1) {
     try {
-      const info = await stat(join(current, '.git'))
-      if (info.isDirectory() || info.isFile()) return current
+      const info = await statDir(join(current, '.git'))
+      if (info) return current
     } catch {
       // not a git root; walk up
     }
@@ -99,6 +124,16 @@ async function findProjectRoot(cwd: string): Promise<string> {
     current = parent
   }
   return cwd
+}
+
+/** stat a path and return whether it exists as a file or directory. */
+async function statDir(path: string): Promise<boolean> {
+  try {
+    const info = await stat(path)
+    return info.isDirectory() || info.isFile()
+  } catch {
+    return false
+  }
 }
 
 /** Read one memory file; returns undefined when missing or unreadable. */
@@ -120,33 +155,52 @@ function truncate(text: string, budget: number): string {
 }
 
 /**
- * Compose the memory context digest from the index file, falling back to
- * per-file summaries when no index exists yet.
+ * Compose the memory context digest: pointer-style index rows + state digest.
+ * The index block is capped by lines and bytes; over the cap the context marks
+ * `indexOverCap` so the injection carries an explicit WARNING (Claude Code's
+ * "Only part of it was loaded" lesson — never silently truncate).
  */
 export async function composeMemoryContext(
   dir: string,
   maxBytes: number,
+  maxIndexLines = DEFAULT_MAX_INDEX_LINES,
+  maxIndexBytes = DEFAULT_MAX_INDEX_BYTES,
 ): Promise<MemoryContext> {
   const rows: MemoryIndexRow[] = []
-  const indexText = await readMemoryFile(dir, 'index.md')
+  let indexOverCap = false
+  const indexText = await readMemoryFile(dir, INDEX_FILE)
   if (indexText !== undefined) {
+    // Pointer-style rows: `- [Title](file.md) — summary` (one line each).
+    let lineCount = 0
+    let byteCount = 0
     for (const line of indexText.split('\n')) {
-      const match = /^\| `([a-z]+\.md)` \| (.+?) \|/.exec(line.trim())
-      if (match !== null) rows.push({ file: match[1]!, summary: match[2]!.trim() })
+      const trimmed = line.trim()
+      if (trimmed === '') continue
+      const match = /^- \[(.+?)\]\(<([^>]+\.md)>\)\s*(?:—|-)?\s*(.*)$/.exec(trimmed)
+      if (match !== null) {
+        lineCount += 1
+        byteCount += Buffer.byteLength(line, 'utf8')
+        if (lineCount <= maxIndexLines && byteCount <= maxIndexBytes) {
+          rows.push({ file: match[2]!, summary: match[3]!.trim() || match[1]!.trim() })
+        } else {
+          indexOverCap = true
+        }
+      }
     }
   }
-  if (rows.length === 0) {
-    for (const file of MEMORY_FILES) {
+  if (rows.length === 0 && !indexOverCap) {
+    // No index yet: derive per-file summaries from the first heading.
+    for (const file of KNOWLEDGE_FILES) {
       const text = await readMemoryFile(dir, file)
       if (text === undefined) continue
       const heading = /^#\s+(.+)$/m.exec(text)?.[1]?.trim()
       rows.push({ file, summary: heading ?? '（无标题）' })
     }
   }
-  const last = await readMemoryFile(dir, 'last.md')
-  const context: MemoryContext = { index: rows, budget: maxBytes }
-  if (last !== undefined) {
-    context.last = truncate(last, Math.floor(maxBytes / 2))
+  const state = await readMemoryFile(dir, STATE_FILE)
+  const context: MemoryContext = { index: rows, indexOverCap, budget: maxBytes }
+  if (state !== undefined && state.trim() !== '') {
+    context.state = truncate(state, Math.floor(maxBytes / 2))
   }
   return context
 }
@@ -155,19 +209,27 @@ export async function composeMemoryContext(
 export function renderMemoryContext(context: MemoryContext): string {
   const lines: string[] = []
   if (context.index.length > 0) {
-    lines.push('以下为本工作区记忆索引（.dsh/memory/）：')
+    lines.push('以下为本工作区记忆索引（.dsh/memory/index.md）：')
     for (const row of context.index) {
-      lines.push(`- \`${row.file}\`：${row.summary}`)
+      lines.push(`- ${row.file}：${row.summary}`)
+    }
+    if (context.indexOverCap) {
+      lines.push('')
+      lines.push('> WARNING: 记忆索引超过行数/字节上限，部分条目未加载。请精简索引或拆分话题文件。')
     }
   }
-  if (context.last !== undefined && context.last.trim() !== '') {
+  if (context.state !== undefined) {
     lines.push('')
-    lines.push('上次会话结束状态（.dsh/memory/last.md）：')
-    lines.push(context.last)
+    lines.push('当前工作区状态（.dsh/memory/state.md）：')
+    lines.push(context.state)
   }
   if (lines.length === 0) return ''
   lines.push('')
-  lines.push('如需查阅完整记忆或写入新经验，调用 memory_recall / memory_update 工具。')
+  lines.push(
+    '记忆纪律：记忆只是提示——行动前用真实文件核实。'
+    + '如需查阅完整记忆或写入新经验，调用 memory_recall / memory_update / memory_state 工具。'
+    + '完成非平凡工作后应把经验写入记忆，使其跨会话存活。',
+  )
   return lines.join('\n')
 }
 
@@ -176,7 +238,7 @@ async function ensureMemoryDir(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true })
 }
 
-/** Append an entry to a category file, then rebuild the index. */
+/** Append an entry to a knowledge file, then rebuild the pointer index. */
 export async function appendMemoryEntry(
   dir: string,
   category: string,
@@ -184,31 +246,110 @@ export async function appendMemoryEntry(
   body: string,
 ): Promise<void> {
   await ensureMemoryDir(dir)
+  const file = `${category}.md`
   const date = new Date().toISOString().slice(0, 10)
   const entry = `\n## [+] ${title} (${date})\n\n${body.trim()}\n`
-  let existing = await readMemoryFile(dir, `${category}.md`)
+  let existing = await readMemoryFile(dir, file)
   existing = existing ?? `# ${category}\n\n`
   if (!existing.endsWith('\n')) existing += '\n'
-  await writeFile(join(dir, `${category}.md`), existing + entry, 'utf8')
+  await writeFile(join(dir, file), existing + entry, 'utf8')
   await rebuildIndex(dir)
 }
 
-/** Rebuild `index.md` from the category files' `[+]` entries. */
+/** Rebuild `index.md` as pointer rows from the knowledge files' `[+]` entries. */
 export async function rebuildIndex(dir: string): Promise<void> {
   const rows: MemoryIndexRow[] = []
-  for (const file of MEMORY_FILES) {
+  for (const file of KNOWLEDGE_FILES) {
     const text = await readMemoryFile(dir, file)
     if (text === undefined) continue
-    const entries: string[] = []
     for (const match of text.matchAll(/^## \[\+\]\s+(.+?)\s*\((\d{4}-\d{2}-\d{2})\)/gm)) {
-      entries.push(`- ${match[1]} (${match[2]})`)
+      rows.push({ file, summary: `${match[1]} (${match[2]})` })
     }
-    rows.push({ file, summary: entries.length > 0 ? entries.join('；') : '（暂无条目）' })
   }
-  const lines = ['# 记忆索引', '', '| 文件 | 摘要 |', '|------|------|']
-  for (const row of rows) lines.push(`| \`${row.file}\` | ${row.summary} |`)
-  lines.push('', '> 由 dsh-memory 自动维护；每次写入记忆条目后重建。')
-  await writeFile(join(dir, 'index.md'), lines.join('\n') + '\n', 'utf8')
+  const lines = ['# 记忆索引', '']
+  for (const row of rows) {
+    lines.push(`- [${row.summary.split(' (')[0]!}](<${row.file}>) — ${row.summary}`)
+  }  lines.push('', '> 由 dsh-memory 自动维护；每次写入记忆条目后重建。')
+  await writeFile(join(dir, INDEX_FILE), lines.join('\n') + '\n', 'utf8')
+}
+
+/** Read the state file and split it into its sections. */
+export async function readState(dir: string): Promise<Record<string, string>> {
+  const text = await readMemoryFile(dir, STATE_FILE)
+  if (text === undefined) return {}
+  const sections: Record<string, string> = {}
+  let current: string | undefined
+  for (const line of text.split('\n')) {
+    const heading = /^##\s+(.+)$/.exec(line.trim())
+    if (heading !== null) {
+      current = heading[1]!.trim()
+      sections[current] = ''
+    } else if (current !== undefined) {
+      sections[current] += `${line}\n`
+    }
+  }
+  return sections
+}
+
+/** Update one section of state.md, preserving the others. */
+export async function updateStateSection(
+  dir: string,
+  section: string,
+  body: string,
+): Promise<void> {
+  await ensureMemoryDir(dir)
+  const sections = await readState(dir)
+  const hadFile = Object.keys(sections).length > 0 || await fileExists(dir, STATE_FILE)
+  sections[section] = body.trim() === '' ? '' : `${body.trim()}\n`
+  const lines = ['# 工作区状态', '']
+  for (const [name, content] of Object.entries(sections)) {
+    if (content === '') continue
+    lines.push(`## ${name}`, '', content.trimEnd(), '')
+  }
+  if (!hadFile && Object.values(sections).every(content => content === '')) {
+    // First creation with no content yet: seed the standard sections so the
+    // file is self-documenting.
+    lines.push(
+      '## 当前进度', '',
+      '（未记录）', '',
+      '## 上次会话状态', '',
+      '（未记录）', '',
+      '## 经验暂存', '',
+      '（待确认归档的经验条目，下次会话提醒用户确认）', '',
+    )
+  }
+  await writeFile(join(dir, STATE_FILE), lines.join('\n') + '\n', 'utf8')
+}
+
+/** Whether a file exists at `dir/name`. */
+async function fileExists(dir: string, name: string): Promise<boolean> {
+  try {
+    await stat(join(dir, name))
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Keyword grep across all memory files (Claude Code's grep-over-RAG stance). */
+export async function searchMemory(dir: string, query: string): Promise<string> {
+  const needle = query.toLowerCase()
+  const results: string[] = []
+  const files = [INDEX_FILE, STATE_FILE, ...KNOWLEDGE_FILES]
+  for (const file of files) {
+    const text = await readMemoryFile(dir, file)
+    if (text === undefined) continue
+    const matches: string[] = []
+    for (const line of text.split('\n')) {
+      if (line.toLowerCase().includes(needle)) matches.push(line.trim())
+    }
+    if (matches.length > 0) {
+      results.push(`### ${file}`)
+      results.push(...matches.slice(0, 20))
+      if (matches.length > 20) results.push(`… 共 ${matches.length} 行匹配`)
+    }
+  }
+  return results.length > 0 ? results.join('\n') : `（无匹配：${query}）`
 }
 
 /** Guard a raw memory path against traversal outside .dsh/memory/. */
@@ -219,18 +360,17 @@ function normalizeMemoryPath(path: string): string {
 }
 
 /**
- * Register the memory plugin: session-boundary injection plus the model-facing
- * tools.
+ * Register the memory plugin: session-boundary injection, turn-end reminder,
+ * and the model-facing tools.
  * @param ctx - registrant context carrying the tool registry.
  * @param config - memory plugin configuration.
  */
 export function apply(ctx: Context, config: Config): void {
-  const maxBytes = config.maxBytes
-  const toolsEnabled = config.toolsEnabled
+  const { maxBytes, toolsEnabled, maxIndexLines, maxIndexBytes, turnEndReminder } = config
 
   // ── session-boundary injection ────────────────────────────────────────
   // Fold a bounded memory digest into every entering step's message batch,
-  // right after the claimed batch, mirroring dsh-agent-instructions.
+  // right after the claimed batch (agent-instructions discipline).
   ctx.on('agent/pre-step', async (
     { agent, messages, signal },
     next,
@@ -241,19 +381,43 @@ export function apply(ctx: Context, config: Config): void {
     const cwd = agent.session.header.cwd
     if (cwd === undefined) return decision
     const dir = await memoryDirOf(cwd)
-    const context = await composeMemoryContext(dir, maxBytes)
+    const context = await composeMemoryContext(dir, maxBytes, maxIndexLines, maxIndexBytes)
     const text = renderMemoryContext(context)
     if (text === '') return decision
     const block: UserMessageLike = {
       content: [{ type: 'text', text }],
       source: { kind: 'dsh-memory' as never },
     }
-    // Insert after the last claimed message so the direct prompt precedes the
-    // memory digest and the driver-appended runtime context follows it.
     const lastClaimed = decision.messages.findLastIndex(message => messages.includes(message))
     const entered = decision.messages.toSpliced(lastClaimed + 1, 0, block as never)
     return { kind: 'enter', messages: entered }
   })
+
+  // ── turn-end reminder ─────────────────────────────────────────────────
+  // After every turn, nudge the agent to persist non-trivial experience.
+  // The reminder lands in the inbox and is folded into the next step.
+  if (turnEndReminder) {
+    ctx.on('session/event', (session, event) => {
+      if (event.type !== 'turn/end') return
+      const cwd = session.header.cwd
+      if (cwd === undefined) return
+      void (async () => {
+        const dir = await memoryDirOf(cwd)
+        await ensureMemoryDir(dir)
+        const agent = ctx.get('agents') as { get(id: string): { inbox: InboxLike } | undefined } | undefined
+        const entry = agent?.get(session.id)
+        if (entry === undefined) return
+        const reminder: UserMessageLike = {
+          content: [{ type: 'text', text:
+            '本回合已结束。如果本回合产生了值得跨会话保留的经验（架构决策/代码模式/排查经验/用户偏好），'
+            + '请在下一回合用 memory_update 或 memory_state 工具写入工作区记忆（.dsh/memory/）。'
+            + '判断标准：解决新问题、发现模式、做决策、踩坑——否则无需写入。' }],
+          source: { kind: 'dsh-memory' as never },
+        }
+        entry.inbox.prepend('next-step', reminder as never)
+      })()
+    })
+  }
 
   if (!toolsEnabled) return
 
@@ -262,17 +426,24 @@ export function apply(ctx: Context, config: Config): void {
     name: 'memory_recall',
     description:
       'Progressive lookup into the workspace memory (.dsh/memory). With no argument, '
-      + 'returns the index digest. Pass a category (decisions | patterns | troubleshooting | '
-      + 'last | current) to read that file; pass a raw path under .dsh/memory/ to read it '
-      + 'directly. Use at session start and when the task relates to past work or project knowledge.',
+      + 'returns the index digest. Pass a category (decisions | patterns | troubleshooting | user) '
+      + 'to read that file; pass state to read state.md; pass query for a keyword grep across '
+      + 'all memory files; pass a raw path under .dsh/memory/ to read it directly. '
+      + 'Use at session start and when the task relates to past work or project knowledge. '
+      + 'Memory is only a hint — verify against real files before acting.',
     parameters: {
       category: {
         type: 'string',
-        description: 'decisions | patterns | troubleshooting | last | current (omit for the index digest).',
+        enum: [...KNOWLEDGE_FILES.map(f => f.replace('.md', '')), 'state'],
+        description: 'decisions | patterns | troubleshooting | user | state (omit for the index digest).',
+      },
+      query: {
+        type: 'string',
+        description: 'Keyword to grep across all memory files (overrides category).',
       },
       path: {
         type: 'string',
-        description: 'Raw file path under .dsh/memory/ to read (overrides category).',
+        description: 'Raw file path under .dsh/memory/ to read (highest priority).',
       },
     },
     output: {
@@ -296,19 +467,17 @@ export function apply(ctx: Context, config: Config): void {
           const text = await readMemoryFile(dir, safe)
           return { text: text ?? `（无此文件：${safe}）` }
         }
+        const query = typeof args.query === 'string' && args.query.trim() !== '' ? args.query.trim() : undefined
+        if (query !== undefined) {
+          return { text: await searchMemory(dir, query) }
+        }
         const category = typeof args.category === 'string' ? args.category : undefined
         if (category !== undefined) {
-          if (category === 'last' || category === 'current') {
-            const text = await readMemoryFile(dir, `${category}.md`)
-            return { text: text ?? '（暂无该记忆文件）' }
-          }
-          if (!(KNOWLEDGE_CATEGORIES as readonly string[]).includes(category)) {
-            throw new Error(`未知记忆分类：${category}（decisions | patterns | troubleshooting | last | current）`)
-          }
-          const text = await readMemoryFile(dir, `${category}.md`)
+          const file = category === 'state' ? STATE_FILE : `${category}.md`
+          const text = await readMemoryFile(dir, file)
           return { text: text ?? '（该分类暂无条目）' }
         }
-        const context = await composeMemoryContext(dir, maxBytes)
+        const context = await composeMemoryContext(dir, maxBytes, maxIndexLines, maxIndexBytes)
         return { text: renderMemoryContext(context) || '（暂无记忆）' }
       })()
     },
@@ -319,15 +488,17 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(defineTool({
     name: 'memory_update',
     description:
-      'Persist an experience entry into the workspace memory (.dsh/memory). '
+      'Persist an experience entry into a knowledge file of the workspace memory (.dsh/memory). '
       + 'Category decides the file: decisions (architecture decisions), patterns (code patterns), '
-      + 'troubleshooting (debugging experience). Use after completing non-trivial work so the '
-      + 'knowledge survives the session; the index is rebuilt automatically.',
+      + 'troubleshooting (debugging experience), user (user preferences). '
+      + 'Use after completing non-trivial work so the knowledge survives the session; '
+      + 'the pointer index is rebuilt automatically. Only record information that is not '
+      + 'derivable from code or git history.',
     parameters: {
       category: {
         type: 'string',
         required: true,
-        enum: [...KNOWLEDGE_CATEGORIES],
+        enum: [...KNOWLEDGE_FILES.map(f => f.replace('.md', ''))],
         description: 'Which memory file to append to.',
       },
       title: {
@@ -369,10 +540,62 @@ export function apply(ctx: Context, config: Config): void {
     },
     presentCall: args => ({ card: 'generic', title: 'Update workspace memory', kind: 'other', rawInput: args }),
   }))
+
+  // ── memory_state ──────────────────────────────────────────────────────
+  ctx.tools.register(defineTool({
+    name: 'memory_state',
+    description:
+      'Update the workspace state file (.dsh/memory/state.md) — current progress, '
+      + 'last-session state, or staged experience. Use at session boundaries: update '
+      + '"当前进度" as you make progress, update "上次会话状态" at the end of a session, '
+      + 'and stage non-trivial experience under "经验暂存" for user confirmation '
+      + '(the next session surfaces it before archiving into a knowledge file).',
+    parameters: {
+      section: {
+        type: 'string',
+        required: true,
+        enum: ['当前进度', '上次会话状态', '经验暂存'],
+        description: 'Which state.md section to replace.',
+      },
+      body: {
+        type: 'string',
+        required: true,
+        description: 'The section content (empty string clears the section).',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.ok ? '状态已更新' : '状态未更新' }],
+    },
+    execute(args, exec) {
+      const cwd = exec.agent?.session.header.cwd
+      if (cwd === undefined) throw new Error('memory_state requires an owning agent session')
+      const section = typeof args.section === 'string' ? args.section : ''
+      const body = typeof args.body === 'string' ? args.body : ''
+      if (section === '') throw new Error('memory_state 需要 section')
+      return (async () => {
+        const dir = await memoryDirOf(cwd)
+        await updateStateSection(dir, section, body)
+        return { ok: true }
+      })()
+    },
+    presentCall: args => ({ card: 'generic', title: 'Update workspace state', kind: 'other', rawInput: args }),
+  }))
 }
 
 /** Minimal user-message shape used for the injected memory block. */
 interface UserMessageLike {
   content: { type: string; text: string }[]
   source: { kind: string }
+}
+
+/** Minimal inbox face used by the turn-end reminder. */
+interface InboxLike {
+  prepend(phase: 'next-step', message: UserMessageLike): void
 }

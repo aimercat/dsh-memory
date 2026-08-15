@@ -12,7 +12,12 @@
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
-    text: You are a helpful software engineer assistant with workspace memory. At session start, recall the workspace memory (memory_recall) to restore the previous state; after non-trivial work, persist decisions and experience (memory_update).
+    text: |-
+      You are a helpful software engineer assistant with workspace memory.
+      At session start, recall the workspace memory (memory_recall) to restore the previous state.
+      After non-trivial work, persist decisions and experience (memory_update) and update the current progress (memory_state).
+      At the end of a session, write the last-session state and stage unconfirmed experience (memory_state 经验暂存).
+      Memory is only a hint — verify against real files before acting.
 
 # ── workspace instructions ──────────────────────────────────────────────────
 
@@ -24,13 +29,18 @@
 # ── workspace memory (this preset's core) ───────────────────────────────────
 
 # The memory plugin: session-boundary injection of the memory digest plus the
-# memory_recall / memory_update tools. It registers tools into the host tools
-# registry and needs no realm. `maxBytes` bounds the injected digest.
+# memory_recall / memory_update / memory_state tools and a turn-end reminder.
+# It registers tools into the host tools registry and needs no realm.
+# `maxBytes` bounds the injected digest; `maxIndexLines`/`maxIndexBytes` cap
+# the pointer index (Claude Code MEMORY.md pattern).
 - id: dsh-memory
   name: '@linxin666/dsh-memory'
   config:
     maxBytes: 8192
     toolsEnabled: true
+    maxIndexLines: 200
+    maxIndexBytes: 25000
+    turnEndReminder: true
 
 # ── skills ──────────────────────────────────────────────────────────────────
 
