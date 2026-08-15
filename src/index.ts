@@ -36,6 +36,7 @@
 import { readFile, writeFile, mkdir, stat } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
+import Schema from '@deepseek-ai/schemastery'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
@@ -76,14 +77,14 @@ export interface Config {
   turnEndReminder: boolean
 }
 
-/** Schemastery-style config object (plain shape for the loader). */
-export const Config = {
-  maxBytes: 8192,
-  toolsEnabled: true,
-  maxIndexLines: DEFAULT_MAX_INDEX_LINES,
-  maxIndexBytes: DEFAULT_MAX_INDEX_BYTES,
-  turnEndReminder: true,
-}
+/** 插件配置 schema，供 Cordis loader 做校验与默认值注入。 */
+export const Config = Schema.object({
+  maxBytes: Schema.number().default(8192).description('注入到模型上下文的记忆字节预算；0 表示禁用注入。'),
+  toolsEnabled: Schema.boolean().default(true).description('是否注册 memory_recall / memory_update / memory_state 工具。'),
+  maxIndexLines: Schema.number().default(DEFAULT_MAX_INDEX_LINES).description('记忆索引注入的最大行数。'),
+  maxIndexBytes: Schema.number().default(DEFAULT_MAX_INDEX_BYTES).description('记忆索引注入的最大字节数。'),
+  turnEndReminder: Schema.boolean().default(true).description('是否在回合结束后提示持久化非平凡经验。'),
+})
 
 /** One pointer row of the index digest. */
 export interface MemoryIndexRow {
