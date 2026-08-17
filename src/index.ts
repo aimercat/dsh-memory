@@ -92,6 +92,8 @@ export interface Config {
   turnEndReminder: boolean
   /** Whether the user-level memory layer (~/.dsh/memory/) is injected and reachable. */
   userMemory: boolean
+  /** Whether this workspace registers for cross-workspace lookup (L3). */
+  crossWorkspace: boolean
 }
 
 /** 插件配置 schema，供 Cordis loader 做校验与默认值注入。 */
@@ -102,6 +104,7 @@ export const Config = Schema.object({
   maxIndexBytes: Schema.number().default(DEFAULT_MAX_INDEX_BYTES).description('记忆索引注入的最大字节数。'),
   turnEndReminder: Schema.boolean().default(true).description('是否在回合结束后提示持久化非平凡经验。'),
   userMemory: Schema.boolean().default(true).description('是否启用用户级记忆（~/.dsh/memory/，个人偏好与跨项目经验）并注入其索引。'),
+  crossWorkspace: Schema.boolean().default(true).description('是否将本工作区登记进跨工作区检索注册表（敏感项目请关闭）。'),
 })
 
 /** One pointer row of the index digest. */
@@ -600,6 +603,91 @@ export function renderFuzzySuggestions(query: string, hits: FuzzyHit[]): string 
     lines.push(`- ${hit.file}：${hit.title}（相关度 ${Math.round(hit.score * 100)}%）`)
   }
   lines.push('', '候选条目仅作参考——如需查看详情，用 memory_recall 读取对应分类。')
+  return lines.join('\n')
+}
+
+// ── cross-workspace lookup (L3, explicit opt-in recall) ───────────────────
+
+/** The workspace registry file inside the user-level memory dir. */
+export const WORKSPACES_FILE = 'workspaces.md'
+
+/** One registered workspace. */
+export interface WorkspaceEntry {
+  /** Directory basename, used as the display alias. */
+  name: string
+  /** Absolute path of the workspace root (the .dsh/memory parent). */
+  path: string
+}
+
+/**
+ * Read the cross-workspace registry (`~/.dsh/memory/workspaces.md`). The
+ * registry is explicit and opt-in: only workspaces that wrote memory while
+ * crossWorkspace was enabled appear here — nothing is auto-discovered.
+ */
+export async function listWorkspaces(userDir: string): Promise<WorkspaceEntry[]> {
+  const text = await readMemoryFile(userDir, WORKSPACES_FILE)
+  if (text === undefined) return []
+  const entries: WorkspaceEntry[] = []
+  for (const line of text.split('\n')) {
+    const match = /^- \[(.+?)\]\(<(.+)>\)/.exec(line.trim())
+    if (match !== null) entries.push({ name: match[1]!, path: match[2]! })
+  }
+  return entries
+}
+
+/**
+ * Register `memoryDir` (a workspace's .dsh/memory) in the user-level registry
+ * (idempotent, serialized). The display name is the project-root basename.
+ * Called after a successful workspace memory write while crossWorkspace is
+ * enabled; sensitive projects disable the flag and never appear here.
+ */
+export function registerWorkspace(userDir: string, memoryDir: string): Promise<void> {
+  return serializedWrite(async () => {
+    // memoryDir = <project>/.dsh/memory → project root is two levels up
+    const projectRoot = dirname(dirname(memoryDir))
+    const name = projectRoot.split(/[\\/]/).pop() ?? memoryDir
+    const entries = await listWorkspaces(userDir)
+    if (entries.some(entry => entry.path === memoryDir)) return
+    const lines = ['# 已知工作区（跨工作区检索注册表）', '',
+      '> 由 dsh-memory 自动维护：工作区写入记忆时登记。敏感项目可在配置关闭',
+      '> crossWorkspace 后不再登记；已登记条目可手动删除。', '']
+    for (const entry of entries) lines.push(`- [${entry.name}](<${entry.path}>)`)
+    lines.push(`- [${name}](<${memoryDir}>)`)
+    await ensureMemoryDir(userDir)
+    await atomicWriteFile(join(userDir, WORKSPACES_FILE), lines.join('\n') + '\n')
+  })
+}
+
+/**
+ * Search every registered workspace EXCEPT the current one. Results carry a
+ * `工作区<name>/` source label so the model always knows the knowledge is not
+ * from the current project (联想按需、来源标注、永不进常驻注入).
+ */
+export async function searchAcrossWorkspaces(
+  userDir: string,
+  currentDir: string,
+  query: string,
+): Promise<string> {
+  const workspaces = await listWorkspaces(userDir)
+  const parts: string[] = []
+  for (const entry of workspaces) {
+    if (entry.path === currentDir) continue // 排除当前工作区
+    const text = await searchMemory(entry.path, query, `工作区<${entry.name}>/`)
+    // 只丢弃裸失败（（无匹配：…）；fuzzy 候选以「（无精确匹配：…」开头，必须保留
+    if (!text.startsWith('（无匹配：')) parts.push(text)
+  }
+  if (parts.length === 0) return `（跨工作区无匹配：${query}。已注册 ${workspaces.length} 个工作区。）`
+  return parts.join('\n\n')
+}
+
+/** Render the registry listing for the model (scope=across without query). */
+export function renderWorkspaceRegistry(entries: WorkspaceEntry[]): string {
+  if (entries.length === 0) {
+    return '（跨工作区检索注册表为空：尚无工作区登记。工作区写入记忆且开启 crossWorkspace 后会自动登记。）'
+  }
+  const lines = ['🌐 已注册工作区（scope=across 可检索，排除当前工作区）：', '']
+  for (const entry of entries) lines.push(`- ${entry.name}：${entry.path}`)
+  lines.push('', '用法：memory_recall 传 scope="across" + query 在其他工作区的记忆中搜索。')
   return lines.join('\n')
 }
 
@@ -1186,6 +1274,8 @@ export interface MemoryToolConfig {
   maxIndexBytes: number
   /** User-level memory dir override (tests inject a temp dir; default ~/.dsh/memory). */
   userMemoryDir?: string
+  /** Whether workspace writes register this project for cross-workspace lookup (default true). */
+  crossWorkspace?: boolean
 }
 
 /** A minimal run context carrying the owning agent's session cwd. */
@@ -1199,7 +1289,7 @@ export interface MemoryToolExec {
  * action branching, path traversal guard) with a fake exec context.
  */
 export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
-  const { maxBytes, maxIndexLines, maxIndexBytes } = config
+  const { maxBytes, maxIndexLines, maxIndexBytes, crossWorkspace = true } = config
   const userDir = config.userMemoryDir ?? userMemoryDirOf()
 
   // ── memory_recall ─────────────────────────────────────────────────────
@@ -1228,10 +1318,13 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
       },
       scope: {
         type: 'string',
-        enum: ['workspace', 'user', 'all'],
+        enum: ['workspace', 'user', 'all', 'across'],
         description: 'workspace (default): the project .dsh/memory only. '
           + 'user: the user-level ~/.dsh/memory (personal preferences, cross-project experience). '
-          + 'all: both layers, user results labeled as such.',
+          + 'all: both layers, user results labeled as such. '
+          + 'across: search other REGISTERED workspaces (workspaces.md) — explicit '
+          + 'cross-project recall, results carry a 工作区<name>/ source label; '
+          + 'current workspace is excluded.',
       },
     },
     output: {
@@ -1247,9 +1340,18 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
     execute(args, exec: MemoryToolExec) {
       const cwd = exec.agent?.session?.header?.cwd
       if (cwd === undefined) throw new Error('memory_recall requires an owning agent session')
-      const scope = args.scope === 'user' || args.scope === 'all' ? args.scope : 'workspace'
+      const scope = args.scope === 'user' || args.scope === 'all' || args.scope === 'across'
+        ? args.scope
+        : 'workspace'
       return (async () => {
         const workspaceDir = await memoryDirOf(cwd)
+        if (scope === 'across') {
+          const query = typeof args.query === 'string' && args.query.trim() !== '' ? args.query.trim() : undefined
+          if (query !== undefined) {
+            return { text: await searchAcrossWorkspaces(userDir, workspaceDir, query) }
+          }
+          return { text: renderWorkspaceRegistry(await listWorkspaces(userDir)) }
+        }
         const dir = scope === 'user' ? userDir : workspaceDir
         const rawPath = typeof args.path === 'string' ? args.path : undefined
         if (rawPath !== undefined) {
@@ -1382,6 +1484,11 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
           : await supersedeEntry(dir, category, supersede, title)
         const duplicates = await findDuplicateTitles(dir, category, title)
         await appendMemoryEntry(dir, category, title, body)
+        // A successful workspace write registers this project in the
+        // cross-workspace registry (L3), unless the flag is off (sensitive).
+        if (scope === 'workspace' && crossWorkspace) {
+          await registerWorkspace(userDir, dir)
+        }
         return { ok: true, file: `${category}.md`, superseded, duplicates }
       })()
     },

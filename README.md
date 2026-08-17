@@ -21,15 +21,18 @@ Harness 新会话默认是"白纸"——除 AGENTS.md 与会话历史外，工�
 └── archive.md        记忆归档（被取代/重复的条目移入此处，可手动恢复）
 
 ~/.dsh/memory/        用户级记忆（L2 共享层）
-└── 同构的 index.md + 四类知识文件（无 state.md）
+├── 同构的 index.md + 四类知识文件（无 state.md）
+└── workspaces.md     跨工作区检索注册表（L3，自动登记）
 ```
 
-**记忆分层（L2）**：工作区记忆保持项目独立（默认注入，占 70% 预算）；用户级
+**记忆分层（L2/L3）**：工作区记忆保持项目独立（默认注入，占 70% 预算）；用户级
 记忆 `~/.dsh/memory/` 记录个人偏好与跨项目通用经验（注入时占 30% 预算，带独立
 来源标注，绝不与项目知识混编）。工具 `scope` 参数控制读写层：`memory_update` /
 `memory_compact` 支持 `scope: workspace | user`，`memory_recall` 额外支持
-`scope: all`（合并检索，用户级结果带「用户级/」标注）。敏感项目可在配置关
-`userMemory: false` 完全禁用用户级层。
+`scope: all`（合并检索，用户级结果带「用户级/」标注）与 `scope: across`
+（跨工作区检索：在注册表登记的工作区中显式联想，结果带「工作区\<名\>/」来源
+标注，自动排除当前工作区，永不进常驻注入）。工作区写入记忆时自动登记；敏感
+项目配置 `crossWorkspace: false` 即不再登记。`userMemory: false` 可禁用用户级层。
 
 设计参照 Claude Code Auto Memory 骨架 + harness 适配（详见 `docs/方案选型分析-推荐.md`）：
 
@@ -39,8 +42,9 @@ Harness 新会话默认是"白纸"——除 AGENTS.md 与会话历史外，工�
 3. **模型工具**：
    - `memory_recall`：渐进式查阅——无参返回索引摘要；传 `category`
      （decisions/patterns/troubleshooting/user/state）读对应文件；传 `query` 做
-     grep 关键词搜索；传 `path` 直接读 `.dsh/memory/` 下任意文件；
-     `scope`（workspace/user/all）跨层检索，`all` 合并两层、用户级结果带来源标注
+     grep 关键词搜索（无匹配自动模糊兜底）；传 `path` 直接读 `.dsh/memory/` 下任意文件；
+     `scope`（workspace/user/all/across）跨层检索：`all` 合并两层带来源标注，
+     `across` 搜其他已登记工作区（带「工作区\<名\>/」标注，排除当前）
    - `memory_update`：把经验条目追加进四类知识文件并重建指针索引；可传
      `supersede`（同分类的旧条目标题）把旧条目标记为已废弃，避免重复条目；
      `scope: user` 写入用户级记忆（仅个人偏好/跨项目经验）
@@ -91,6 +95,7 @@ Copy-Item "<repo-path>\preset\memory" "$env:USERPROFILE\.dsh\.agent-presets\memo
 | `maxIndexBytes` | `25000` | 指针索引注入字节上限 |
 | `turnEndReminder` | `true` | 每回合结束是否提示 Agent 考虑写入记忆 |
 | `userMemory` | `true` | 是否启用用户级记忆（~/.dsh/memory/）并注入其索引 |
+| `crossWorkspace` | `true` | 是否将本工作区登记进跨工作区检索注册表（敏感项目请关闭） |
 
 ## 开发
 
