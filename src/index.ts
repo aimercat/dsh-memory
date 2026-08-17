@@ -33,6 +33,7 @@
  * @module @deepseek-ai/dsh-memory
  */
 
+import { randomUUID } from 'node:crypto'
 import { readFile, writeFile, mkdir, stat } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -371,13 +372,21 @@ export function apply(ctx: Context, config: Config): void {
 
   // ── session-boundary injection ────────────────────────────────────────
   // Fold a bounded memory digest into every entering step's message batch,
-  // right after the claimed batch (agent-instructions discipline).
+  // right after the claimed batch (agent-instructions discipline). One digest
+  // per message batch: a single model turn often fans out into several
+  // `agent/pre-step` hooks (thinking steps, tool-call steps, continuations),
+  // and re-injecting the same digest for each would duplicate the block.
   ctx.on('agent/pre-step', async (
     { agent, messages, signal },
     next,
   ): Promise<PreStepDecision> => {
     const decision = await next()
     if (maxBytes <= 0 || decision.kind === 'reject') return decision
+    // Dedup guard: if this batch already carries a memory digest, leave it
+    // alone — never inject the same memory context twice into one turn.
+    if (decision.messages.some(message => (message as { source?: { kind?: string } }).source?.kind === 'dsh-memory')) {
+      return decision
+    }
     signal?.throwIfAborted()
     const cwd = agent.session.header.cwd
     if (cwd === undefined) return decision
@@ -386,6 +395,8 @@ export function apply(ctx: Context, config: Config): void {
     const text = renderMemoryContext(context)
     if (text === '') return decision
     const block: UserMessageLike = {
+      id: randomUUID(),
+      role: 'user',
       content: [{ type: 'text', text }],
       source: { kind: 'dsh-memory' as never },
     }
@@ -403,19 +414,31 @@ export function apply(ctx: Context, config: Config): void {
       const cwd = session.header.cwd
       if (cwd === undefined) return
       void (async () => {
-        const dir = await memoryDirOf(cwd)
-        await ensureMemoryDir(dir)
-        const agent = ctx.get('agents') as { get(id: string): { inbox: InboxLike } | undefined } | undefined
-        const entry = agent?.get(session.id)
-        if (entry === undefined) return
-        const reminder: UserMessageLike = {
-          content: [{ type: 'text', text:
-            '本回合已结束。如果本回合产生了值得跨会话保留的经验（架构决策/代码模式/排查经验/用户偏好），'
-            + '请在下一回合用 memory_update 或 memory_state 工具写入工作区记忆（.dsh/memory/）。'
-            + '判断标准：解决新问题、发现模式、做决策、踩坑——否则无需写入。' }],
-          source: { kind: 'dsh-memory' as never },
+        try {
+          const dir = await memoryDirOf(cwd)
+          await ensureMemoryDir(dir)
+          const agent = ctx.get('agents') as { get(id: string): { inbox: InboxLike } | undefined } | undefined
+          const entry = agent?.get(session.id)
+          if (entry === undefined) return
+          // One reminder per pending batch: never queue a second while one is
+          // already waiting for the next step (the inbox would pile up stale
+          // nudges and duplicate the same message identity).
+          if (entry.inbox.nextStep.some(message => message.source?.kind === 'dsh-memory')) return
+          const reminder: UserMessageLike = {
+            id: randomUUID(),
+            role: 'user',
+            content: [{ type: 'text', text:
+              '本回合已结束。如果本回合产生了值得跨会话保留的经验（架构决策/代码模式/排查经验/用户偏好），'
+              + '请在下一回合用 memory_update 或 memory_state 工具写入工作区记忆（.dsh/memory/）。'
+              + '判断标准：解决新问题、发现模式、做决策、踩坑——否则无需写入。' }],
+            source: { kind: 'dsh-memory' as never },
+          }
+          entry.inbox.prepend('next-step', reminder as never)
+        } catch (error) {
+          // The reminder is a best-effort nudge; a queueing failure must never
+          // take down the host process with an unhandled rejection.
+          ctx.logger.warn('memory turn-end reminder failed: %o', error)
         }
-        entry.inbox.prepend('next-step', reminder as never)
       })()
     })
   }
@@ -592,11 +615,16 @@ export function apply(ctx: Context, config: Config): void {
 
 /** Minimal user-message shape used for the injected memory block. */
 interface UserMessageLike {
+  /** Stable unique identity; the agent inbox rejects messages without one. */
+  id: string
+  /** Session replay expects injected user-visible messages to carry the user role. */
+  role: 'user'
   content: { type: string; text: string }[]
   source: { kind: string }
 }
 
 /** Minimal inbox face used by the turn-end reminder. */
 interface InboxLike {
+  readonly nextStep: readonly UserMessageLike[]
   prepend(phase: 'next-step', message: UserMessageLike): void
 }

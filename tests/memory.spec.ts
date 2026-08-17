@@ -1,6 +1,7 @@
 // @vitest-environment node
 /** dsh-memory v2 core: memory dir resolution, pointer index, state sections, entry append, grep search. */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { randomUUID } from 'node:crypto'
 import { mkdtemp, mkdir, writeFile, rm, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -146,5 +147,75 @@ describe('searchMemory (grep)', () => {
     const dir = await memoryDirOf(root)
     const result = await searchMemory(dir, '不存在的词')
     expect(result).toContain('无匹配')
+  })
+})
+
+/**
+ * Minimal model of the agent inbox contract: every pending message carries a
+ * unique `id`, and a second pending message with the same identity throws
+ * `message "<id>" is already pending` (the harness's `Inbox.validate`).
+ * The memory plugin's turn-end reminder queues into this face.
+ */
+class FakeInbox {
+  nextStep: { id?: string; source: { kind?: string } }[] = []
+
+  prepend(_phase: 'next-step', message: { id?: string; source: { kind?: string } }): void {
+    if (this.nextStep.some(pending => pending.id === message.id)) {
+      throw new Error(`message "${message.id}" is already pending`)
+    }
+    this.nextStep.unshift(message)
+  }
+}
+
+describe('turn-end reminder inbox discipline', () => {
+  it('reproduces the crash: two id-less reminders collide as "undefined"', () => {
+    const inbox = new FakeInbox()
+    const first = { content: [{ type: 'text', text: '第一回合' }], source: { kind: 'dsh-memory' } }
+    const second = { content: [{ type: 'text', text: '第二回合' }], source: { kind: 'dsh-memory' } }
+    inbox.prepend('next-step', first)
+    expect(() => inbox.prepend('next-step', second))
+      .toThrow('message "undefined" is already pending')
+  })
+
+  it('queues at most one identified dsh-memory reminder per pending batch', () => {
+    const inbox = new FakeInbox()
+    const queueReminder = (): number => {
+      // Same decision the plugin's turn-end handler makes.
+      if (inbox.nextStep.some(message => message.source?.kind === 'dsh-memory')) {
+        return inbox.nextStep.length
+      }
+      inbox.prepend('next-step', {
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text: '本回合已结束。' }],
+        source: { kind: 'dsh-memory' },
+      })
+      return inbox.nextStep.length
+    }
+    expect(queueReminder()).toBe(1)
+    expect(queueReminder()).toBe(1)
+    expect(inbox.nextStep).toHaveLength(1)
+    expect(inbox.nextStep[0]?.id).toBeTypeOf('string')
+    expect(inbox.nextStep[0]?.role).toBe('user')
+  })
+})
+
+describe('pre-step digest injection dedup guard', () => {
+  it('skips injection when the batch already carries a dsh-memory digest', () => {
+    // Same predicate the plugin's agent/pre-step hook uses before composing
+    // and injecting a memory block.
+    const hasMemoryDigest = (messages: { source?: { kind?: string } }[]): boolean =>
+      messages.some(message => message.source?.kind === 'dsh-memory')
+
+    const withoutDigest = [
+      { id: 'user-1', role: 'user', content: [{ type: 'text', text: '你好' }] },
+    ]
+    expect(hasMemoryDigest(withoutDigest)).toBe(false)
+
+    const withDigest = [
+      { id: 'user-1', role: 'user', content: [{ type: 'text', text: '你好' }] },
+      { id: 'mem-1', role: 'user', content: [{ type: 'text', text: '记忆索引…' }], source: { kind: 'dsh-memory' } },
+    ]
+    expect(hasMemoryDigest(withDigest)).toBe(true)
   })
 })

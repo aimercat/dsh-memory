@@ -3,3 +3,4 @@ lib/
 *.tsbuildinfo
 dist/
 .npm-cache/
+.dsh/
