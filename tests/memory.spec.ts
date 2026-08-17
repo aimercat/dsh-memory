@@ -200,22 +200,39 @@ describe('turn-end reminder inbox discipline', () => {
   })
 })
 
-describe('pre-step digest injection dedup guard', () => {
-  it('skips injection when the batch already carries a dsh-memory digest', () => {
-    // Same predicate the plugin's agent/pre-step hook uses before composing
-    // and injecting a memory block.
-    const hasMemoryDigest = (messages: { source?: { kind?: string } }[]): boolean =>
-      messages.some(message => message.source?.kind === 'dsh-memory')
+describe('pre-step digest injection turn-level dedup', () => {
+  it('injects once per turn even across plugin instances and roots', () => {
+    // The plugin keeps a module-level singleton map: a profile may mount the
+    // plugin twice (host-plane bundle + agent-plane preset row) on different
+    // Cordis roots, so per-root maps would let each instance inject its own
+    // digest copy. Keyed by agent.id (unique per session), cross-root sharing
+    // cannot collide unrelated agents.
+    const shared = new Map<string, number>()
+    const makeInstance = (): ((agentId: string, turn: number) => boolean) => {
+      const shouldInject = (agentId: string, turn: number): boolean => {
+        if (shared.get(agentId) === turn) return false
+        shared.set(agentId, turn)
+        return true
+      }
+      return shouldInject
+    }
 
-    const withoutDigest = [
-      { id: 'user-1', role: 'user', content: [{ type: 'text', text: '你好' }] },
-    ]
-    expect(hasMemoryDigest(withoutDigest)).toBe(false)
+    const hostPlane = makeInstance()
+    const agentPlane = makeInstance()
 
-    const withDigest = [
-      { id: 'user-1', role: 'user', content: [{ type: 'text', text: '你好' }] },
-      { id: 'mem-1', role: 'user', content: [{ type: 'text', text: '记忆索引…' }], source: { kind: 'dsh-memory' } },
-    ]
-    expect(hasMemoryDigest(withDigest)).toBe(true)
+    // Turn 1, step 1 (user message): host-plane instance injects.
+    expect(hostPlane('session-1', 1)).toBe(true)
+    // Turn 1, step 2 (tool call): agent-plane instance skips — shared map.
+    expect(agentPlane('session-1', 1)).toBe(false)
+    // Turn 1, step 3 (continuation): host-plane skips too.
+    expect(hostPlane('session-1', 1)).toBe(false)
+
+    // Turn 2 opens (next user round): fresh digest, inject again (via agent).
+    expect(agentPlane('session-1', 2)).toBe(true)
+    expect(hostPlane('session-1', 2)).toBe(false)
+
+    // Another agent is tracked independently.
+    expect(agentPlane('session-2', 1)).toBe(true)
+    expect(hostPlane('session-1', 2)).toBe(false)
   })
 })

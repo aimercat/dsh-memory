@@ -367,33 +367,49 @@ function normalizeMemoryPath(path: string): string {
  * @param ctx - registrant context carrying the tool registry.
  * @param config - memory plugin configuration.
  */
+/**
+ * Turn-level injection dedup shared across ALL plugin instances in the
+ * process. A profile may mount dsh-memory twice (host-plane bundle + the
+ * agent-plane preset row), and the two mounts may live on different Cordis
+ * roots — a per-root map would separate them and each instance would inject
+ * its own digest copy (the observed ×2 in Aris sessions, ×1 in standard
+ * ones). A module-level singleton is deliberately NOT keyed by root: the
+ * dedup key is `agent.id`, which is unique per session, so cross-root
+ * sharing cannot collide unrelated agents.
+ */
+const lastInjectedTurns = new Map<string, number>()
+
 export function apply(ctx: Context, config: Config): void {
   const { maxBytes, toolsEnabled, maxIndexLines, maxIndexBytes, turnEndReminder } = config
 
-  // ── session-boundary injection ────────────────────────────────────────
-  // Fold a bounded memory digest into every entering step's message batch,
-  // right after the claimed batch (agent-instructions discipline). One digest
-  // per message batch: a single model turn often fans out into several
-  // `agent/pre-step` hooks (thinking steps, tool-call steps, continuations),
-  // and re-injecting the same digest for each would duplicate the block.
+  // ── turn-boundary injection ──────────────────────────────────────────
+  // Fold a bounded memory digest into the FIRST pre-step of each turn, right
+  // after the claimed batch (agent-instructions discipline). `agent/pre-step`
+  // fires once per model step and `payload.messages` only carries the messages
+  // removed from the inbox for THAT step — never the whole conversation — so
+  // a per-batch dedup check can never see an earlier injection. A single turn
+  // (one user round) routinely spans several steps (thinking, tool calls,
+  // continuations), so dedupe on `turn`: inject once at the turn's first
+  // step, skip the rest, and inject again when the next turn opens with a
+  // fresh digest. The dedup map is shared across plugin instances within the
+  // app (host-plane bundle + agent-plane preset row), otherwise each instance
+  // injects its own copy of the digest.
   ctx.on('agent/pre-step', async (
-    { agent, messages, signal },
+    { agent, messages, signal, turn },
     next,
   ): Promise<PreStepDecision> => {
     const decision = await next()
     if (maxBytes <= 0 || decision.kind === 'reject') return decision
-    // Dedup guard: if this batch already carries a memory digest, leave it
-    // alone — never inject the same memory context twice into one turn.
-    if (decision.messages.some(message => (message as { source?: { kind?: string } }).source?.kind === 'dsh-memory')) {
-      return decision
-    }
     signal?.throwIfAborted()
+    // Turn-level dedup: this turn already received its memory digest.
+    if (lastInjectedTurns.get(agent.id) === turn) return decision
     const cwd = agent.session.header.cwd
     if (cwd === undefined) return decision
     const dir = await memoryDirOf(cwd)
     const context = await composeMemoryContext(dir, maxBytes, maxIndexLines, maxIndexBytes)
     const text = renderMemoryContext(context)
     if (text === '') return decision
+    lastInjectedTurns.set(agent.id, turn)
     const block: UserMessageLike = {
       id: randomUUID(),
       role: 'user',
