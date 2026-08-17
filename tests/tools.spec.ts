@@ -10,10 +10,12 @@ import {
 } from '../src/index.ts'
 
 let root: string
+let userDir: string
 let exec: MemoryToolExec
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'dsh-memory-tools-'))
+  userDir = join(root, 'user-home')
   exec = { agent: { session: { header: { cwd: root } } } }
 })
 
@@ -22,7 +24,14 @@ afterEach(async () => {
 })
 
 const tools = (): Record<string, ReturnType<typeof createMemoryTools>[number]> => {
-  const list = createMemoryTools({ maxBytes: 8192, maxIndexLines: 200, maxIndexBytes: 25_000 })
+  // userMemoryDir MUST be injected: without it, workspace-scope writes would
+  // register the temp workspace in the REAL user registry (~/.dsh/memory/workspaces.md)
+  const list = createMemoryTools({
+    maxBytes: 8192,
+    maxIndexLines: 200,
+    maxIndexBytes: 25_000,
+    userMemoryDir: userDir,
+  })
   return Object.fromEntries(list.map(tool => [tool.name, tool]))
 }
 

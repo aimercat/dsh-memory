@@ -36,7 +36,7 @@
 import { randomUUID } from 'node:crypto'
 import { readFile, writeFile, mkdir, stat, rename, rm } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
@@ -641,7 +641,20 @@ export async function listWorkspaces(userDir: string): Promise<WorkspaceEntry[]>
  * Called after a successful workspace memory write while crossWorkspace is
  * enabled; sensitive projects disable the flag and never appear here.
  */
+/**
+ * Whether a workspace write should be registered for cross-workspace lookup.
+ * Throwaway temp directories are skipped, but ONLY when `userDir` is the real
+ * user layer — tests injecting a temp userDir must still exercise the flow.
+ */
+export function shouldRegisterWorkspace(userDir: string, memoryDir: string): boolean {
+  const realUserDir = userMemoryDirOf()
+  const isRealRegistry = userDir.toLowerCase() === realUserDir.toLowerCase()
+  const isTempWorkspace = memoryDir.toLowerCase().startsWith(tmpdir().toLowerCase())
+  return !(isRealRegistry && isTempWorkspace)
+}
+
 export function registerWorkspace(userDir: string, memoryDir: string): Promise<void> {
+  if (!shouldRegisterWorkspace(userDir, memoryDir)) return Promise.resolve()
   return serializedWrite(async () => {
     // memoryDir = <project>/.dsh/memory → project root is two levels up
     const projectRoot = dirname(dirname(memoryDir))
@@ -1107,8 +1120,14 @@ export function parseStagedEntries(text: string): StagedEntry[] {
 }
 
 /** Render staged entries as a numbered list for the model/user. */
-export function renderStagedEntries(entries: StagedEntry[]): string {
-  if (entries.length === 0) return '（经验暂存区为空）'
+export function renderStagedEntries(entries: StagedEntry[], rawText = ''): string {
+  if (entries.length === 0) {
+    if (rawText.trim() !== '') {
+      return '（经验暂存区有内容，但格式无法解析。期望每行：`- [ ] {category}: {title}[ — {body}]`'
+        + `，例如 \`- [ ] patterns: 状态机用 Switch+Enum\`。当前原文：\n\n${rawText.trim()}）`
+    }
+    return '（经验暂存区为空）'
+  }
   const lines = ['📥 经验暂存区（state.md「经验暂存」），共 ' + `${entries.length} 条：`, '']
   for (const entry of entries) {
     const body = entry.body === '' ? '' : ` — ${entry.body}`
@@ -1340,23 +1359,41 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
     execute(args, exec: MemoryToolExec) {
       const cwd = exec.agent?.session?.header?.cwd
       if (cwd === undefined) throw new Error('memory_recall requires an owning agent session')
-      const scope = args.scope === 'user' || args.scope === 'all' || args.scope === 'across'
+      // Scope semantics:
+      //   undefined  → combined digest (workspace + user), matches the injection
+      //   workspace  → project .dsh/memory only (explicit single layer)
+      //   user       → user-level ~/.dsh/memory only
+      //   all        → both layers merged, user results labeled
+      //   across     → other registered workspaces (L3 explicit recall)
+      const rawScope = args.scope === 'user' || args.scope === 'all' || args.scope === 'across'
         ? args.scope
-        : 'workspace'
+        : args.scope === 'workspace'
+          ? 'workspace'
+          : undefined
       return (async () => {
         const workspaceDir = await memoryDirOf(cwd)
-        if (scope === 'across') {
+        if (rawScope === 'across') {
           const query = typeof args.query === 'string' && args.query.trim() !== '' ? args.query.trim() : undefined
           if (query !== undefined) {
             return { text: await searchAcrossWorkspaces(userDir, workspaceDir, query) }
           }
           return { text: renderWorkspaceRegistry(await listWorkspaces(userDir)) }
         }
-        const dir = scope === 'user' ? userDir : workspaceDir
+        // No arguments at all and no explicit scope: return the combined
+        // digest (workspace + user), mirroring the session-boundary injection.
+        if (rawScope === undefined
+          && args.path === undefined
+          && args.query === undefined
+          && args.category === undefined) {
+          const ws = await composeMemoryContext(workspaceDir, maxBytes, maxIndexLines, maxIndexBytes)
+          const us = await composeMemoryContext(userDir, maxBytes, maxIndexLines, maxIndexBytes)
+          return { text: renderCombinedMemoryContext(ws, us) || '（暂无记忆）' }
+        }
+        const dir = rawScope === 'user' ? userDir : workspaceDir
         const rawPath = typeof args.path === 'string' ? args.path : undefined
         if (rawPath !== undefined) {
           const safe = normalizeMemoryPath(rawPath)
-          if (scope === 'all') {
+          if (rawScope === 'all') {
             const ws = await readMemoryFile(workspaceDir, safe)
             if (ws !== undefined) return { text: ws }
             const us = await readMemoryFile(userDir, safe)
@@ -1367,7 +1404,7 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
         }
         const query = typeof args.query === 'string' && args.query.trim() !== '' ? args.query.trim() : undefined
         if (query !== undefined) {
-          if (scope === 'all') {
+          if (rawScope === 'all') {
             const ws = await searchMemory(workspaceDir, query)
             const us = await searchMemory(userDir, query, '用户级/')
             const parts = [ws, us].filter(text => !text.startsWith('（无匹配'))
@@ -1378,7 +1415,7 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
         }
         const category = typeof args.category === 'string' ? args.category : undefined
         if (category !== undefined) {
-          if (scope === 'all') {
+          if (rawScope === 'all') {
             const file = category === 'state' ? STATE_FILE : `${category}.md`
             const ws = await readMemoryFile(workspaceDir, file)
             const us = category === 'state' ? undefined : await readMemoryFile(userDir, `${category}.md`)
@@ -1391,7 +1428,7 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
           const text = await readMemoryFile(dir, file)
           return { text: text ?? '（该分类暂无条目）' }
         }
-        if (scope === 'all') {
+        if (rawScope === 'all') {
           const ws = await composeMemoryContext(workspaceDir, maxBytes, maxIndexLines, maxIndexBytes)
           const us = await composeMemoryContext(userDir, maxBytes, maxIndexLines, maxIndexBytes)
           return { text: renderCombinedMemoryContext(ws, us) || '（暂无记忆）' }
@@ -1503,7 +1540,9 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
       + 'last-session state, or staged experience. Use at session boundaries: update '
       + '"当前进度" as you make progress, update "上次会话状态" at the end of a session, '
       + 'and stage non-trivial experience under "经验暂存" for user confirmation '
-      + '(the next session surfaces it before archiving into a knowledge file).',
+      + '(the next session surfaces it before archiving into a knowledge file). '
+      + 'Staging format — one entry per line: "- [ ] {category}: {title}[ — {body}]", '
+      + 'e.g. "- [ ] patterns: 状态机用 Switch+Enum".',
     parameters: {
       section: {
         type: 'string',
@@ -1514,7 +1553,7 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
       body: {
         type: 'string',
         required: true,
-        description: 'The section content (empty string clears the section).',
+        description: 'The section content. For 经验暂存: one "- [ ] category: title[ — body]" per line.',
       },
     },
     output: {
@@ -1641,14 +1680,14 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
         const staged = sections['经验暂存'] ?? ''
         const entries = parseStagedEntries(staged)
         if (indexArg === '') {
-          return { text: renderStagedEntries(entries), archived: [], remaining: entries.length }
+          return { text: renderStagedEntries(entries, staged), archived: [], remaining: entries.length }
         }
         const select: number[] | 'all' = indexArg === 'all'
           ? 'all'
           : indexArg.split(',').map(part => Number.parseInt(part.trim(), 10))
             .filter(number => Number.isFinite(number) && number > 0)
         if (select !== 'all' && select.length === 0) {
-          return { text: '（未选择有效条目编号）\n\n' + renderStagedEntries(entries), archived: [], remaining: entries.length }
+          return { text: '（未选择有效条目编号）\n\n' + renderStagedEntries(entries, staged), archived: [], remaining: entries.length }
         }
         const result = await confirmStagedEntries(dir, select)
         const lines = ['✅ 经验归档完成：']

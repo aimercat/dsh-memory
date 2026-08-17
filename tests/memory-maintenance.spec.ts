@@ -13,6 +13,7 @@ import {
   parseEntryHeader,
   parseStagedEntries,
   removeEntryBlocks,
+  renderStagedEntries,
   reportMemory,
   splitEntryBlocks,
   supersedeEntry,
@@ -289,5 +290,13 @@ describe('confirmStagedEntries', () => {
     const result = await confirmStagedEntries(root, 'all')
     expect(result.archived).toEqual(['secret: 不知名分类（跳过：非知识分类）'])
     expect(result.remaining).toBe(0)
+  })
+
+  it('warns about unparseable staging content instead of pretending it is empty', async () => {
+    await updateStateSection(root, '经验暂存', '一条没有按格式写的经验')
+    const text = renderStagedEntries(parseStagedEntries('一条没有按格式写的经验'), '一条没有按格式写的经验')
+    expect(text).toContain('格式无法解析')
+    expect(text).toContain('- [ ] {category}: {title}')
+    expect(text).toContain('一条没有按格式写的经验') // 原文可见
   })
 })

@@ -167,6 +167,20 @@ describe('memory_recall scope', () => {
     const result = await run('memory_recall', { query: '通用' })
     expect(result.text).toBe('（无匹配：通用）')
   })
+
+  it('no-argument recall returns the combined digest (workspace + user)', async () => {
+    const result = await run('memory_recall', {})
+    expect(result.text).toContain('本工作区记忆索引')
+    expect(result.text).toContain('用户级记忆索引')
+    expect(result.text).toContain('工作区模式')
+    expect(result.text).toContain('通用模式')
+  })
+
+  it('explicit scope=workspace with no args stays single-layer', async () => {
+    const result = await run('memory_recall', { scope: 'workspace' })
+    expect(result.text).toContain('本工作区记忆索引')
+    expect(result.text).not.toContain('用户级记忆索引')
+  })
 })
 
 describe('memory_compact scope', () => {

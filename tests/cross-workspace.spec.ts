@@ -10,6 +10,8 @@ import {
   registerWorkspace,
   renderWorkspaceRegistry,
   searchAcrossWorkspaces,
+  shouldRegisterWorkspace,
+  userMemoryDirOf,
   WORKSPACES_FILE,
   type MemoryToolExec,
 } from '../src/index.ts'
@@ -76,6 +78,17 @@ describe('registerWorkspace / listWorkspaces', () => {
     const text = await readFile(join(userDir, WORKSPACES_FILE), 'utf8')
     expect(text).toContain('- [project-beta](<')
     expect(text).toContain(w2Memory)
+  })
+
+  it('skips temp workspaces only in the real user registry (pollution guard)', async () => {
+    const tempMemory = join(tmpdir(), 'dsh-memory-tools-xyz', '.dsh', 'memory')
+    // 注入的 userDir（≠ 真实 home）：测试场景照常登记
+    await registerWorkspace(userDir, tempMemory)
+    expect(await listWorkspaces(userDir)).toHaveLength(1)
+    // 真实 home 的 userDir：tmpdir 工作区被拦截（不写真实注册表）
+    expect(shouldRegisterWorkspace(userMemoryDirOf(), tempMemory)).toBe(false)
+    // 真实 home + 非临时路径（用真实 user 层自身代表 home 下路径）照常登记
+    expect(shouldRegisterWorkspace(userMemoryDirOf(), userMemoryDirOf())).toBe(true)
   })
 })
 
