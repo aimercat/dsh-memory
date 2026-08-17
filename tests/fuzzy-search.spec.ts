@@ -43,6 +43,22 @@ describe('tokenizeForFuzzy', () => {
     const tokens = tokenizeForFuzzy('PostgreSQL')
     expect(tokens.has('postgresql')).toBe(true)
   })
+
+  it('splits camelCase words while keeping the whole word', () => {
+    const tokens = tokenizeForFuzzy('serializedWrite')
+    expect(tokens.has('serializedwrite')).toBe(true) // whole word kept
+    expect(tokens.has('serialized')).toBe(true) // camelCase part
+    expect(tokens.has('write')).toBe(true)
+    // Proper nouns are NOT corrupted: PostgreSQL stays whole
+    expect(tokenizeForFuzzy('PostgreSQL').has('postgresql')).toBe(true)
+  })
+
+  it('bridges a camelCase-heavy query to a stored entry (production finding)', async () => {
+    await appendMemoryEntry(root, 'patterns', '串行写队列', 'serializedWrite 模块级 promise 尾队列防死锁')
+    const hits = await fuzzySuggest(root, 'serialized queue deadlock')
+    expect(hits.length).toBeGreaterThan(0)
+    expect(hits[0]!.title).toContain('串行写队列')
+  })
 })
 
 describe('fuzzyScore', () => {

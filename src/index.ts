@@ -529,20 +529,28 @@ export async function searchMemory(dir: string, query: string, label = ''): Prom
 // ── fuzzy fallback (token overlap, no vector stack) ───────────────────────
 
 /**
- * Tokenize text for fuzzy matching: ASCII words (letters/digits/hyphens)
- * plus CJK bigrams. Cheap and dependency-free — good enough to bridge
- * wording gaps between the query and stored entries.
+ * Tokenize text for fuzzy matching: ASCII words (letters/digits/hyphens,
+ * camelCase split) plus CJK bigrams. Cheap and dependency-free — good enough
+ * to bridge wording gaps between the query and stored entries.
  */
 export function tokenizeForFuzzy(text: string): Set<string> {
   const tokens = new Set<string>()
   const normalized = text.toLowerCase()
   for (const word of normalized.match(/[a-z0-9][a-z0-9-]*/g) ?? []) {
+    // Whole word always kept: "postgresql" must stay searchable intact.
     tokens.add(word)
     // Hyphenated words also contribute their parts: "docker-compose" should
     // match a query searching for "docker" or "compose" alone.
     for (const part of word.split('-')) {
       if (part.length > 1) tokens.add(part)
     }
+  }
+  // camelCase parts on top of the whole word: "serializedWrite" keeps the
+  // full token AND contributes "serialized" + "write" (production finding:
+  // a "serialized queue deadlock" query used to miss it entirely).
+  const camelSplit = text.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase()
+  for (const part of camelSplit.match(/[a-z0-9][a-z0-9-]*/g) ?? []) {
+    tokens.add(part)
   }
   const cjk = normalized.replace(/[^\u4e00-\u9fff]/g, '')
   for (let i = 0; i < cjk.length - 1; i += 1) tokens.add(cjk.slice(i, i + 2))
