@@ -57,12 +57,15 @@ Harness 新会话默认是"白纸"——除 AGENTS.md 与会话历史外，工�
 
 ## 安装
 
-```bash
-# 作为插件装入 profile（与 dsh-web-ui 插件同一机制）
-dsh plugin --profile <name> add link:<本仓库路径>
-```
+> 本插件**只在 agent preset 平面启用**（host 平面不挂载，避免全局注入）。因此
+> 安装 = ① 把包装入 profile 依赖（preset 解析用）+ ② 安装 preset 并选用。
 
-或通过本仓库提供的 Agent preset「记忆模式」直接组装（见下）。
+```bash
+# ① 装入 profile 依赖（仅依赖，不挂载 host 平面）
+dsh plugin --profile <name> add link:<本仓库路径>
+
+# ② 安装 Agent preset「记忆模式」（主方式，见下节）
+```
 
 ## Agent preset：记忆模式
 
