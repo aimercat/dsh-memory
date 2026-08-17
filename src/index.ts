@@ -164,13 +164,25 @@ async function readMemoryFile(dir: string, name: string): Promise<string | undef
   }
 }
 
-/** Truncate to the byte budget, keeping whole lines and marking the cut. */
+/**
+ * Truncate to the byte budget, keeping whole lines and marking the cut.
+ * Lines are accumulated from the start; the first line that would overflow
+ * is partially kept up to the remaining budget (so a single long line can
+ * never collapse the whole digest to a few header characters).
+ */
 function truncate(text: string, budget: number): string {
   if (text.length <= budget) return text
-  const cut = text.slice(0, budget)
-  const newline = cut.lastIndexOf('\n')
-  const body = newline >= 0 ? cut.slice(0, newline) : cut
-  return `${body}\n… (截断：超过 ${budget} 字节预算)`
+  const lines = text.split('\n')
+  let out = ''
+  for (const line of lines) {
+    if (out.length + line.length + 1 > budget) {
+      const remaining = budget - out.length - 1
+      if (remaining > 0) out += line.slice(0, remaining)
+      break
+    }
+    out += `${line}\n`
+  }
+  return `${out.replace(/\n$/, '')}\n… (截断：超过 ${budget} 字节预算)`
 }
 
 /**
@@ -187,6 +199,7 @@ export async function composeMemoryContext(
 ): Promise<MemoryContext> {
   const rows: MemoryIndexRow[] = []
   let indexOverCap = false
+  let injectedIndexBytes = 0
   const indexText = await readMemoryFile(dir, INDEX_FILE)
   if (indexText !== undefined) {
     // Pointer-style rows: `- [Title](file.md) — summary` (one line each).
@@ -198,9 +211,11 @@ export async function composeMemoryContext(
       const match = /^- \[(.+?)\]\(<([^>]+\.md)>\)\s*(?:—|-)?\s*(.*)$/.exec(trimmed)
       if (match !== null) {
         lineCount += 1
-        byteCount += Buffer.byteLength(line, 'utf8')
+        const bytes = Buffer.byteLength(line, 'utf8')
+        byteCount += bytes
         if (lineCount <= maxIndexLines && byteCount <= maxIndexBytes) {
           rows.push({ file: match[2]!, summary: match[3]!.trim() || match[1]!.trim() })
+          injectedIndexBytes += bytes
         } else {
           indexOverCap = true
         }
@@ -218,8 +233,13 @@ export async function composeMemoryContext(
   }
   const state = await readMemoryFile(dir, STATE_FILE)
   const context: MemoryContext = { index: rows, indexOverCap, budget: maxBytes }
-  if (state !== undefined && state.trim() !== '') {
-    context.state = truncate(state, Math.floor(maxBytes / 2))
+  // Dynamic budget: the index (the pointer block) takes priority and the
+  // state digest gets whatever is left. When the index already consumes the
+  // whole budget the state is skipped entirely instead of emitting a
+  // truncated garbage block.
+  const stateBudget = maxBytes - injectedIndexBytes
+  if (state !== undefined && state.trim() !== '' && stateBudget > 0) {
+    context.state = truncate(state, stateBudget)
   }
   return context
 }
@@ -494,7 +514,93 @@ export async function searchMemory(dir: string, query: string, label = ''): Prom
       if (matches.length > 20) results.push(`… 共 ${matches.length} 行匹配`)
     }
   }
-  return results.length > 0 ? results.join('\n') : `（无匹配：${query}）`
+  if (results.length > 0) return results.join('\n')
+  // Exact grep found nothing — fall back to fuzzy suggestions so a wording
+  // mismatch ("port conflicts" vs "docker-compose port mapping") does not
+  // mean total amnesia. The model can then recall the suggested entries.
+  const hits = await fuzzySuggest(dir, query)
+  if (hits.length > 0) return renderFuzzySuggestions(query, hits)
+  return `（无匹配：${query}）`
+}
+
+// ── fuzzy fallback (token overlap, no vector stack) ───────────────────────
+
+/**
+ * Tokenize text for fuzzy matching: ASCII words (letters/digits/hyphens)
+ * plus CJK bigrams. Cheap and dependency-free — good enough to bridge
+ * wording gaps between the query and stored entries.
+ */
+export function tokenizeForFuzzy(text: string): Set<string> {
+  const tokens = new Set<string>()
+  const normalized = text.toLowerCase()
+  for (const word of normalized.match(/[a-z0-9][a-z0-9-]*/g) ?? []) {
+    tokens.add(word)
+    // Hyphenated words also contribute their parts: "docker-compose" should
+    // match a query searching for "docker" or "compose" alone.
+    for (const part of word.split('-')) {
+      if (part.length > 1) tokens.add(part)
+    }
+  }
+  const cjk = normalized.replace(/[^\u4e00-\u9fff]/g, '')
+  for (let i = 0; i < cjk.length - 1; i += 1) tokens.add(cjk.slice(i, i + 2))
+  return tokens
+}
+
+/** Query-coverage score in [0, 1]: the share of query tokens present in the text. */
+export function fuzzyScore(queryTokens: Set<string>, textTokens: Set<string>): number {
+  if (queryTokens.size === 0) return 0
+  let hits = 0
+  for (const token of queryTokens) {
+    if (textTokens.has(token)) hits += 1
+  }
+  return hits / queryTokens.size
+}
+
+/** One fuzzy suggestion: which entry, how relevant. */
+export interface FuzzyHit {
+  file: string
+  title: string
+  /** Query-coverage score in [0, 1]. */
+  score: number
+}
+
+/**
+ * Score every active entry (title + body) against the query by token overlap
+ * and return the closest `limit` hits. This is the wording-mismatch fallback
+ * for exact grep misses — deliberately NOT a vector stack.
+ */
+export async function fuzzySuggest(dir: string, query: string, limit = 5): Promise<FuzzyHit[]> {
+  const queryTokens = tokenizeForFuzzy(query)
+  if (queryTokens.size === 0) return []
+  const hits: FuzzyHit[] = []
+  for (const file of KNOWLEDGE_FILES) {
+    const text = await readMemoryFile(dir, file)
+    if (text === undefined) continue
+    for (const block of splitEntryBlocks(text)) {
+      if (block.superseded) continue
+      const textTokens = tokenizeForFuzzy(`${block.plainTitle} ${block.rawBody}`)
+      const score = fuzzyScore(queryTokens, textTokens)
+      if (score > 0) {
+        hits.push({
+          file,
+          title: block.date === '' ? block.plainTitle : `${block.plainTitle} (${block.date})`,
+          score,
+        })
+      }
+    }
+  }
+  hits.sort((a, b) => b.score - a.score)
+  return hits.slice(0, limit)
+}
+
+/** Render fuzzy suggestions as model-facing text. */
+export function renderFuzzySuggestions(query: string, hits: FuzzyHit[]): string {
+  const lines = [`（无精确匹配：「${query}」。相关条目候选：）`]
+  for (const hit of hits) {
+    lines.push(`- ${hit.file}：${hit.title}（相关度 ${Math.round(hit.score * 100)}%）`)
+  }
+  lines.push('', '候选条目仅作参考——如需查看详情，用 memory_recall 读取对应分类。')
+  return lines.join('\n')
 }
 
 // ── memory maintenance: entry blocks, supersede, archive, compact ────────

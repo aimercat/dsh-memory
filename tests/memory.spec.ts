@@ -85,14 +85,29 @@ describe('state.md sections', () => {
 })
 
 describe('composeMemoryContext', () => {
-  it('reads pointer rows and truncates state.md to half the budget', async () => {
+  it('prioritizes the index and gives the state the remaining budget', async () => {
     const dir = await memoryDirOf(root)
     await appendMemoryEntry(dir, 'decisions', '方案 A', '内容')
     await updateStateSection(dir, '上次会话状态', 'x'.repeat(2000))
     const context = await composeMemoryContext(dir, 1000)
     expect(context.index.some(row => row.file === 'decisions.md')).toBe(true)
-    expect(context.state!.length).toBeLessThanOrEqual(600)
+    // The state gets the leftover budget (1000 - injected index bytes),
+    // not a fixed half — so it must be well above the old 500-byte half.
+    expect(context.state!.length).toBeGreaterThan(600)
+    expect(context.state!.length).toBeLessThanOrEqual(1000)
     expect(context.indexOverCap).toBe(false)
+  })
+
+  it('skips the state entirely when the index already consumes the budget', async () => {
+    const dir = await memoryDirOf(root)
+    await mkdir(dir, { recursive: true })
+    // ~1800 bytes of index rows: far beyond a 200-byte budget.
+    const many = Array.from({ length: 30 }, (_, i) => `- [标题${i}](<decisions.md>) — 条目 ${i} 填充内容`).join('\n')
+    await writeFile(join(dir, 'index.md'), `# 记忆索引\n\n${many}\n`, 'utf8')
+    await writeFile(join(dir, 'state.md'), '# 工作区状态\n\n## 上次会话状态\n\n重要内容\n', 'utf8')
+    const context = await composeMemoryContext(dir, 200)
+    expect(context.index.length).toBe(30)
+    expect(context.state).toBeUndefined()
   })
 
   it('marks indexOverCap when the index exceeds the line cap', async () => {
