@@ -94,6 +94,12 @@ export interface Config {
   userMemory: boolean
   /** Whether this workspace registers for cross-workspace lookup (L3). */
   crossWorkspace: boolean
+  /** Inline confirmation flow (v1.1 P0): false restores the legacy single reminder. */
+  inlineConfirm: boolean
+  /** Unconfirmed exposure strikes before auto-degrade to archive (default 3). */
+  confirmStrikes: number
+  /** Cooldown for the empty-staging reminder: skip if reminded within N turns (default 5). */
+  remindCooldownTurns: number
 }
 
 /** 插件配置 schema，供 Cordis loader 做校验与默认值注入。 */
@@ -105,6 +111,9 @@ export const Config = Schema.object({
   turnEndReminder: Schema.boolean().default(true).description('是否在回合结束后提示持久化非平凡经验。'),
   userMemory: Schema.boolean().default(true).description('是否启用用户级记忆（~/.dsh/memory/，个人偏好与跨项目经验）并注入其索引。'),
   crossWorkspace: Schema.boolean().default(true).description('是否将本工作区登记进跨工作区检索注册表（敏感项目请关闭）。'),
+  inlineConfirm: Schema.boolean().default(true).description('内联确认流：回合结束提炼 ≤3 条候选并立即确认/忽略；false 恢复旧版单态提醒。'),
+  confirmStrikes: Schema.number().default(3).description('候选未确认的提醒暴露次数上限，达到后自动降级为仅日志（移入 archive）。'),
+  remindCooldownTurns: Schema.number().default(5).description('空暂存提醒的冷却回合数：最近 N 个回合内提醒过则不再提示。'),
 })
 
 /** One pointer row of the index digest. */
@@ -1104,9 +1113,18 @@ export interface StagedEntry {
   title: string
   body: string
   checked: boolean
+  /** Reminder-exposure count from the trailing `[⏳N]` marker (0 = never exposed). */
+  strikes: number
 }
 
-/** Parse the 经验暂存 section into staged entries (non-matching lines skipped). */
+/** Trailing exposure marker on staged lines, e.g. `… [⏳2]`. */
+export const STRIKE_MARKER = /\[⏳(\d+)\]$/
+
+/**
+ * Parse the 经验暂存 section into staged entries (non-matching lines skipped).
+ * A trailing `[⏳N]` exposure marker is stripped from the body and exposed as
+ * `strikes` (rendered as「第 N 次提醒」, never shown raw).
+ */
 export function parseStagedEntries(text: string): StagedEntry[] {
   const entries: StagedEntry[] = []
   let sequence = 0
@@ -1115,16 +1133,44 @@ export function parseStagedEntries(text: string): StagedEntry[] {
     const match = /^-\s+\[([ xX])\]\s+([a-zA-Z-]+):\s*(.+?)\s*(?:—\s*(.+))?$/.exec(lines[i]!.trim())
     if (match === null) continue
     sequence += 1
+    let body = match[4]?.trim() ?? ''
+    let strikes = 0
+    const strikeMatch = STRIKE_MARKER.exec(body)
+    if (strikeMatch !== null) {
+      strikes = Number.parseInt(strikeMatch[1]!, 10)
+      body = body.slice(0, strikeMatch.index).trim()
+    }
     entries.push({
       index: sequence,
       line: i,
       category: match[2]!,
       title: match[3]!.trim(),
-      body: match[4]?.trim() ?? '',
+      body,
       checked: match[1] !== ' ',
+      strikes,
     })
   }
   return entries
+}
+
+/** Category priority for the confirmation exposure window (high value first). */
+const EXPOSURE_PRIORITY = ['decisions', 'troubleshooting', 'patterns']
+
+/**
+ * Deterministic exposure window: at most `limit` candidates, higher-value
+ * categories first (decisions/troubleshooting > patterns > others), then
+ * staging order. Entries outside the window are backlog: they do NOT
+ * participate in strike counting until they enter the window.
+ */
+export function exposureWindow(entries: StagedEntry[], limit = 3): StagedEntry[] {
+  const ranked = [...entries].sort((a, b) => {
+    const pa = EXPOSURE_PRIORITY.indexOf(a.category)
+    const pb = EXPOSURE_PRIORITY.indexOf(b.category)
+    const da = pa === -1 ? EXPOSURE_PRIORITY.length : pa
+    const db = pb === -1 ? EXPOSURE_PRIORITY.length : pb
+    return da - db || a.line - b.line
+  })
+  return ranked.slice(0, limit)
 }
 
 /** Render staged entries as a numbered list for the model/user. */
@@ -1136,12 +1182,18 @@ export function renderStagedEntries(entries: StagedEntry[], rawText = ''): strin
     }
     return '（经验暂存区为空）'
   }
-  const lines = ['📥 经验暂存区（state.md「经验暂存」），共 ' + `${entries.length} 条：`, '']
-  for (const entry of entries) {
+  const window = exposureWindow(entries)
+  const overflow = entries.length - window.length
+  const lines = ['📥 经验暂存区（state.md「经验暂存」）待确认候选：', '']
+  for (const entry of window) {
     const body = entry.body === '' ? '' : ` — ${entry.body}`
-    lines.push(`${entry.index}. [${entry.checked ? 'x' : ' '}] ${entry.category}: ${entry.title}${body}`)
+    const strike = entry.strikes > 0 ? `（第 ${entry.strikes} 次提醒）` : ''
+    lines.push(`${entry.index}. [${entry.checked ? 'x' : ' '}] ${entry.category}: ${entry.title}${body}${strike}`)
   }
-  lines.push('', '确认归档：调用 memory_confirm，index 传 "all" 或逗号分隔编号（如 "1,3"）。')
+  if (overflow > 0) {
+    lines.push('', `（另有 ${overflow} 条积压候选：确认/忽略窗口内条目后自动补位；积压不参与降级计数）`)
+  }
+  lines.push('', '确认归档：memory_confirm index=...（如 "1,3" 或 "all"）；忽略：memory_confirm action=ignore index=...')
   return lines.join('\n')
 }
 
@@ -1180,6 +1232,123 @@ export async function confirmStagedEntries(
   return { archived, remaining }
 }
 
+/** Ignore reasons (enumerable for telemetry; free-text reason is optional). */
+export const IGNORE_REASON_CODES = [
+  'unconfirmed',
+  'duplicate',
+  'wrong-scope',
+  'low-value',
+  'not-stable-yet',
+  'incorrect',
+] as const
+export type IgnoreReasonCode = typeof IGNORE_REASON_CODES[number]
+
+/** Whether `code` is a known ignore reason code. */
+export function isIgnoreReasonCode(code: string): code is IgnoreReasonCode {
+  return IGNORE_REASON_CODES.includes(code as IgnoreReasonCode)
+}
+
+/**
+ * Ignore staged entries: remove them from staging and record them in
+ * archive.md with an `[ignored]` marker (traceable, never hard-deleted).
+ */
+export function ignoreStagedEntries(
+  dir: string,
+  select: number[] | 'all',
+  reasonCode: IgnoreReasonCode = 'unconfirmed',
+  reason = '',
+): Promise<{ ignored: string[]; remaining: number }> {
+  return serializedWrite(async () => {
+    const sections = await readState(dir)
+    const staged = sections['经验暂存'] ?? ''
+    const entries = parseStagedEntries(staged)
+    const wanted = new Set(select === 'all' ? entries.map(entry => entry.index) : select)
+    const chosen = entries.filter(entry => wanted.has(entry.index))
+    if (chosen.length === 0) return { ignored: [], remaining: entries.length }
+    const today = new Date().toISOString().slice(0, 10)
+    const archive = await readMemoryFile(dir, ARCHIVE_FILE)
+    const head = archive ?? '# 记忆归档\n\n> 被取代、重复或忽略的条目移入此处，可手动恢复；由 dsh-memory 自动维护。\n'
+    const chunk = chosen
+      .map(entry =>
+        `## [ignored] ${entry.category}: ${entry.title} — ${today} 忽略：[${reasonCode}]${reason === '' ? '' : ` ${reason}`}\n\n`
+        + (entry.body === '' ? '（无正文）\n' : `${entry.body}\n`))
+      .join('\n')
+    await atomicWriteFile(join(dir, ARCHIVE_FILE), head.endsWith('\n') ? head + chunk : `${head}\n\n${chunk}`)
+    const removeLines = new Set(chosen.map(entry => entry.line))
+    const kept = staged
+      .split('\n')
+      .filter((_, i) => !removeLines.has(i))
+      .join('\n')
+      .trim()
+    await updateStateSection(dir, '经验暂存', kept)
+    return { ignored: chosen.map(entry => `${entry.category}: ${entry.title}`), remaining: parseStagedEntries(kept).length }
+  })
+}
+
+/**
+ * Bump the exposure counter (`[⏳N]`) of every staged line ONCE per call.
+ * Only exposure-window candidates are bumped — backlog entries do not count
+ * until they enter the window (they have never been shown to the user).
+ */
+export async function bumpStagedStrikes(dir: string): Promise<void> {
+  const sections = await readState(dir)
+  const staged = sections['经验暂存'] ?? ''
+  const entries = parseStagedEntries(staged)
+  if (entries.length === 0) return
+  const window = exposureWindow(entries)
+  const windowLines = new Set(window.map(entry => entry.line))
+  const bumped = staged
+    .split('\n')
+    .map((line, i) => {
+      if (!windowLines.has(i)) return line
+      const current = STRIKE_MARKER.exec(line)?.[1]
+      const next = current === undefined ? 1 : Number.parseInt(current, 10) + 1
+      const cleaned = current === undefined ? line : line.replace(STRIKE_MARKER, '').trimEnd()
+      return `${cleaned} [⏳${next}]`
+    })
+    .join('\n')
+    .trim()
+  if (bumped !== staged.trim()) {
+    await updateStateSection(dir, '经验暂存', bumped)
+  }
+}
+
+/**
+ * Degrade candidates whose exposure count reached the strike limit: move them
+ * to archive.md with an `[ignored-3x]` marker and remove them from staging.
+ * Runs automatically at turn-end (no agent involvement), fully reversible.
+ */
+export function degradeStagedEntries(
+  dir: string,
+  strikeLimit: number,
+): Promise<{ degraded: string[] }> {
+  return serializedWrite(async () => {
+    const sections = await readState(dir)
+    const staged = sections['经验暂存'] ?? ''
+    const entries = parseStagedEntries(staged)
+    const window = exposureWindow(entries)
+    const doomed = window.filter(entry => entry.strikes >= strikeLimit)
+    if (doomed.length === 0) return { degraded: [] }
+    const today = new Date().toISOString().slice(0, 10)
+    const archive = await readMemoryFile(dir, ARCHIVE_FILE)
+    const head = archive ?? '# 记忆归档\n\n> 被取代、重复或忽略的条目移入此处，可手动恢复；由 dsh-memory 自动维护。\n'
+    const chunk = doomed
+      .map(entry =>
+        `## [ignored-3x] ${entry.category}: ${entry.title} — ${today} 连续 ${strikeLimit} 次未确认降级\n\n`
+        + (entry.body === '' ? '（无正文）\n' : `${entry.body}\n`))
+      .join('\n')
+    await atomicWriteFile(join(dir, ARCHIVE_FILE), head.endsWith('\n') ? head + chunk : `${head}\n\n${chunk}`)
+    const removeLines = new Set(doomed.map(entry => entry.line))
+    const kept = staged
+      .split('\n')
+      .filter((_, i) => !removeLines.has(i))
+      .join('\n')
+      .trim()
+    await updateStateSection(dir, '经验暂存', kept)
+    return { degraded: doomed.map(entry => `${entry.category}: ${entry.title}`) }
+  })
+}
+
 /** Guard a raw memory path against traversal outside .dsh/memory/. */
 function normalizeMemoryPath(path: string): string {
   const cleaned = path.replace(/\\/g, '/').replace(/^\/+/, '')
@@ -1205,8 +1374,22 @@ function normalizeMemoryPath(path: string): string {
  */
 const lastInjectedTurns = new Map<string, number>()
 
+/** Cooldown state for the empty-staging reminder (sessionId → last remind turn). */
+const lastEmptyRemind = new Map<string, { lastTurn: number; count: number }>()
+
 export function apply(ctx: Context, config: Config): void {
-  const { maxBytes, toolsEnabled, maxIndexLines, maxIndexBytes, turnEndReminder, userMemory } = config
+  const {
+    maxBytes,
+    toolsEnabled,
+    maxIndexLines,
+    maxIndexBytes,
+    turnEndReminder,
+    userMemory,
+    crossWorkspace,
+    inlineConfirm,
+    confirmStrikes,
+    remindCooldownTurns,
+  } = config
 
   // ── turn-boundary injection ──────────────────────────────────────────
   // Fold a bounded memory digest into the FIRST pre-step of each turn, right
@@ -1248,14 +1431,18 @@ export function apply(ctx: Context, config: Config): void {
     return { kind: 'enter', messages: entered }
   })
 
-  // ── turn-end reminder ─────────────────────────────────────────────────
-  // After every turn, nudge the agent to persist non-trivial experience.
-  // The reminder lands in the inbox and is folded into the next step.
+  // ── turn-end reminder (inline confirmation flow, v1.1 P0) ───────────────
+  // Three-state nudge: ① empty staging → suggest staging ≤3 high-value
+  // candidates with cooldown; ② exposed candidates → ask to confirm/ignore
+  // inline, bumping their exposure counter; ③ candidates past the strike
+  // limit → auto-degrade to archive (silent). Never auto-writes to the
+  // knowledge base — confirmation stays explicit.
   if (turnEndReminder) {
     ctx.on('session/event', (session, event) => {
       if (event.type !== 'turn/end') return
       const cwd = session.header.cwd
       if (cwd === undefined) return
+      const turn = event.data.turn
       void (async () => {
         try {
           const dir = await memoryDirOf(cwd)
@@ -1267,13 +1454,62 @@ export function apply(ctx: Context, config: Config): void {
           // already waiting for the next step (the inbox would pile up stale
           // nudges and duplicate the same message identity).
           if (entry.inbox.nextStep.some(message => message.source?.kind === 'dsh-memory')) return
+          if (!inlineConfirm) {
+            // Legacy single-state reminder (inlineConfirm: false).
+            const legacy: UserMessageLike = {
+              id: randomUUID(),
+              role: 'user',
+              content: [{ type: 'text', text:
+                '本回合已结束。如果本回合产生了值得跨会话保留的经验（架构决策/代码模式/排查经验/用户偏好），'
+                + '请在下一回合用 memory_update 或 memory_state 工具写入工作区记忆（.dsh/memory/）。'
+                + '判断标准：解决新问题、发现模式、做决策、踩坑——否则无需写入。' }],
+              source: { kind: 'dsh-memory' as never },
+            }
+            entry.inbox.prepend('next-step', legacy as never)
+            return
+          }
+
+          const sections = await readState(dir)
+          const staged = sections['经验暂存'] ?? ''
+          const entries = parseStagedEntries(staged)
+          const window = exposureWindow(entries)
+          const overflow = entries.length - window.length
+
+          if (window.length > 0) {
+            const maxStrikes = Math.max(...window.map(candidate => candidate.strikes), 0)
+            if (maxStrikes >= confirmStrikes) {
+              // State ③: auto-degrade past-limit candidates, stay silent.
+              await degradeStagedEntries(dir, confirmStrikes)
+              return
+            }
+            // State ②: expose candidates, bump their counters.
+            await bumpStagedStrikes(dir)
+            const reminder: UserMessageLike = {
+              id: randomUUID(),
+              role: 'user',
+              content: [{ type: 'text', text:
+                `有 ${window.length} 条经验候选待确认（第 ${maxStrikes + 1} 次提醒，连续 ${confirmStrikes} 次未处理将自动降级为仅日志）。`
+                + '请逐条内联确认：memory_confirm index=... 归档进知识库，或 memory_confirm action=ignore index=... 忽略。'
+                + (overflow > 0 ? `曝光窗口外另有 ${overflow} 条积压（不参与降级计数，确认后自动补位）。` : '')
+                + '经验暂存区内容可用 memory_confirm 无参查看。' }],
+              source: { kind: 'dsh-memory' as never },
+            }
+            entry.inbox.prepend('next-step', reminder as never)
+            return
+          }
+
+          // State ①: empty staging — suggest staging, gated by cooldown.
+          const cooldown = lastEmptyRemind.get(session.id)
+          const cooldownHit = cooldown !== undefined && turn - cooldown.lastTurn < remindCooldownTurns
+          if (cooldownHit) return
+          lastEmptyRemind.set(session.id, { lastTurn: turn, count: (cooldown?.count ?? 0) + 1 })
           const reminder: UserMessageLike = {
             id: randomUUID(),
             role: 'user',
             content: [{ type: 'text', text:
-              '本回合已结束。如果本回合产生了值得跨会话保留的经验（架构决策/代码模式/排查经验/用户偏好），'
-              + '请在下一回合用 memory_update 或 memory_state 工具写入工作区记忆（.dsh/memory/）。'
-              + '判断标准：解决新问题、发现模式、做决策、踩坑——否则无需写入。' }],
+              '本回合已结束。若本回合产生了高价值经验（架构决策 / 排障经验优先，≤3 条），'
+              + '请用 memory_state 写入经验暂存区（格式 `- [ ] category: title — body`），并立即用 memory_confirm 内联确认归档——不要留到下次会话。'
+              + 'pattern 次优先；user 类偏好请写用户级记忆（scope=user）。' }],
             source: { kind: 'dsh-memory' as never },
           }
           entry.inbox.prepend('next-step', reminder as never)
@@ -1656,14 +1892,32 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
     name: 'memory_confirm',
     description:
       'List or confirm staged-experience entries in state.md (经验暂存). With no index, '
-      + 'lists staged entries with sequence numbers. Pass index="all" or a comma-separated '
-      + 'list (e.g. "1,3") to archive the selected entries into their knowledge files '
-      + '(decisions/patterns/troubleshooting/user, body falls back to the title) and remove '
-      + 'them from the staging area. Run after the user confirms the staged experience.',
+      + 'lists the exposure window (top 3, decisions/troubleshooting first) with sequence '
+      + 'numbers. Pass index="all" or a comma-separated list (e.g. "1,3") to confirm the '
+      + 'selected entries into their knowledge files (body falls back to the title) and '
+      + 'remove them from staging. Pass action="ignore" (+ optional reasonCode/reason) to '
+      + 'discard candidates into archive.md with an [ignored] marker instead. Run after '
+      + 'the user confirms the staged experience.',
     parameters: {
       index: {
         type: 'string',
         description: 'Omit to list; "all" or comma-separated 1-based numbers (e.g. "1,3") to confirm.',
+      },
+      action: {
+        type: 'string',
+        enum: ['confirm', 'ignore'],
+        description: 'confirm (default): archive into the knowledge base. '
+          + 'ignore: discard into archive.md with an [ignored] marker (traceable, reversible).',
+      },
+      reasonCode: {
+        type: 'string',
+        enum: [...IGNORE_REASON_CODES],
+        description: 'Ignore reason code for telemetry (default unconfirmed): '
+          + 'duplicate | wrong-scope | low-value | not-stable-yet | incorrect | unconfirmed.',
+      },
+      reason: {
+        type: 'string',
+        description: 'Optional free-text note attached to the ignore record.',
       },
     },
     output: {
@@ -1682,6 +1936,11 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
       const cwd = exec.agent?.session?.header?.cwd
       if (cwd === undefined) throw new Error('memory_confirm requires an owning agent session')
       const indexArg = typeof args.index === 'string' ? args.index.trim() : ''
+      const action = args.action === 'ignore' ? 'ignore' : 'confirm'
+      const reasonCode = typeof args.reasonCode === 'string' && isIgnoreReasonCode(args.reasonCode)
+        ? args.reasonCode
+        : 'unconfirmed'
+      const reason = typeof args.reason === 'string' ? args.reason.trim() : ''
       return (async () => {
         const dir = await memoryDirOf(cwd)
         const sections = await readState(dir)
@@ -1696,6 +1955,13 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
             .filter(number => Number.isFinite(number) && number > 0)
         if (select !== 'all' && select.length === 0) {
           return { text: '（未选择有效条目编号）\n\n' + renderStagedEntries(entries, staged), archived: [], remaining: entries.length }
+        }
+        if (action === 'ignore') {
+          const result = await ignoreStagedEntries(dir, select, reasonCode, reason)
+          const lines = ['🗑️ 已忽略（移入 archive.md，可手动恢复）：']
+          for (const item of result.ignored) lines.push(`- ${item}`)
+          lines.push('', `暂存区剩余 ${result.remaining} 条。`)
+          return { text: lines.join('\n'), archived: result.ignored, remaining: result.remaining }
         }
         const result = await confirmStagedEntries(dir, select)
         const lines = ['✅ 经验归档完成：']

@@ -52,10 +52,15 @@ Harness 新会话默认是"白纸"——除 AGENTS.md 与会话历史外，工�
    - `memory_compact`：记忆养护——`report` 审计各文件条目统计（重复组/废弃/
      陈旧/索引压力）；`apply` 合并同标题重复条目（保留最新）、把超龄废弃条目
      归档到 archive.md 并重建索引（可逆，不硬删）；`scope: user` 审计用户级
-   - `memory_confirm`：经验暂存确认闭环——列出 state.md 暂存条目，`index="all"`
-     或编号列表把选定条目归档进知识文件并清空暂存区
-4. **经验确认流**：非平凡工作后经验暂存到 state.md，下次会话经 `memory_confirm`
-   确认后归档（闭环完成）；被取代的经验走 `supersede`，超龄废弃条目由
+   - `memory_confirm`：经验确认闭环——列出**曝光窗口**（top 3，decision/
+     troubleshooting 优先）待确认候选；`index="all"` 或编号归档进知识文件；
+     `action=ignore` + `reasonCode`（duplicate/wrong-scope/low-value/...）忽略进
+     archive（可追溯）；窗口外积压不参与降级计数
+4. **内联确认流（v1.1 P0）**：回合结束三态提醒——① 暂存区为空：提炼 ≤3 条
+   高价值候选并**立即**内联确认（带冷却，`remindCooldownTurns`）；② 有曝光候选：
+   逐条确认/忽略，暴露计数 `[⏳N]` 递增（仅窗口内）；③ 连续 `confirmStrikes`（默认
+   3）次未处理 → 自动降级移入 archive `[ignored-3x]`（可逆、静默）。`inlineConfirm:
+   false` 恢复旧版单态提醒。被取代的经验走 `supersede`，超龄废弃条目由
    `memory_compact` 归入 archive.md，杜绝记忆膨胀与冲突误导
 5. **记忆纪律**：记忆只是提示——行动前用真实文件核实；只记代码/git 推导不出的信息
 
