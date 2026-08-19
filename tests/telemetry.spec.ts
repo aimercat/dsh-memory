@@ -1,5 +1,5 @@
 // @vitest-environment node
-/** dsh-memory v1.1 P0.5: recall hit telemetry — stats.json recording and reporting. */
+/** dsh-memory v1.1 P0.5: recall hit telemetry — stats.local.json recording and reporting. */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -50,12 +50,12 @@ describe('recordEntryHit / readStats', () => {
     expect(entry.lastHit).toBeTypeOf('string')
   })
 
-  it('persists to stats.json and tolerates a corrupted file', async () => {
+  it('persists to stats.local.json and tolerates a corrupted file', async () => {
     await recordEntryHit(memoryDir, 'user.md', '偏好', 'grep')
-    const raw = JSON.parse(await readFile(join(memoryDir, 'stats.json'), 'utf8'))
+    const raw = JSON.parse(await readFile(join(memoryDir, 'stats.local.json'), 'utf8'))
     expect(raw.entries['user.md|偏好'].hits).toBe(1)
 
-    await writeFile(join(memoryDir, 'stats.json'), '{broken json', 'utf8')
+    await writeFile(join(memoryDir, 'stats.local.json'), '{broken json', 'utf8')
     const stats = await readStats(memoryDir)
     expect(stats.entries).toEqual({})
   })
@@ -69,11 +69,11 @@ describe('searchMemory telemetry', () => {
     expect(stats.entries['patterns.md|状态机']?.channels.grep).toBe(1)
   })
 
-  it('records suggest-channel hits for fuzzy candidates', async () => {
+  it('records surfaced-channel hits for fuzzy candidates', async () => {
     await appendMemoryEntry(memoryDir, 'patterns', '状态机', '用状态表表达状态转移')
     await searchMemory(memoryDir, 'state table 状态转移') // 精确 miss → fuzzy 命中
     const stats = await readStats(memoryDir)
-    expect(stats.entries['patterns.md|状态机']?.channels.suggest).toBeGreaterThan(0)
+    expect(stats.entries['patterns.md|状态机']?.channels.surfaced).toBeGreaterThan(0)
   })
 
   it('does not record hits for index/state/archive files', async () => {
@@ -130,7 +130,7 @@ describe('renderTelemetrySummary', () => {
     const text = renderTelemetrySummary(stats).join('\n')
     expect(text).toContain('命中统计')
     expect(text).toContain('热门条目(5次)')
-    expect(text).toContain('从未被命中的条目 1 条')
+    expect(text).toContain('当前统计窗口内未命中的条目 1 条')
     expect(text).toContain('冷门条目')
     expect(text).toContain('duplicate:2')
   })

@@ -100,6 +100,8 @@ export interface Config {
   confirmStrikes: number
   /** Cooldown for the empty-staging reminder: skip if reminded within N turns (default 5). */
   remindCooldownTurns: number
+  /** Whether telemetry writes to stats.json (git-committable) instead of stats.local.json (default false). */
+  commitTelemetry: boolean
 }
 
 /** 插件配置 schema，供 Cordis loader 做校验与默认值注入。 */
@@ -114,6 +116,7 @@ export const Config = Schema.object({
   inlineConfirm: Schema.boolean().default(true).description('内联确认流：回合结束提炼 ≤3 条候选并立即确认/忽略；false 恢复旧版单态提醒。'),
   confirmStrikes: Schema.number().default(3).description('候选未确认的提醒暴露次数上限，达到后自动降级为仅日志（移入 archive）。'),
   remindCooldownTurns: Schema.number().default(5).description('空暂存提醒的冷却回合数：最近 N 个回合内提醒过则不再提示。'),
+  commitTelemetry: Schema.boolean().default(false).description('命中统计写入 stats.json（可提交 git）而非 stats.local.json（默认，运行期本地数据）。'),
 })
 
 /** One pointer row of the index digest. */
@@ -510,14 +513,17 @@ async function fileExists(dir: string, name: string): Promise<boolean> {
 
 // ── recall hit telemetry (v1.1 P0.5) ──────────────────────────────────────
 
-/** The telemetry file inside the memory dir (small, git-visible, never in knowledge files). */
+/** Telemetry file name when telemetry is meant to be committed to git. */
 export const STATS_FILE = 'stats.json'
+/** Default telemetry file name: `.local.json` signals "local runtime data, not for git" (review revision). */
+export const DEFAULT_STATS_FILE = 'stats.local.json'
 
 /** How a memory entry was reached by the model. */
-export type HitChannel = 'grep' | 'fuzzy' | 'across' | 'suggest'
+export type HitChannel = 'grep' | 'fuzzy' | 'across' | 'surfaced'
 
 /** Per-entry hit counters. */
 export interface EntryStats {
+  /** True hits (grep + across). */
   hits: number
   lastHit: string
   channels: Partial<Record<HitChannel, number>>
@@ -525,47 +531,64 @@ export interface EntryStats {
 
 /** The telemetry payload. */
 export interface MemoryStats {
+  /** Window metadata: the stats window starts at the first recorded event. */
+  meta: { version: number; windowStartedAt: string }
   entries: Record<string, EntryStats>
   ignored: Partial<Record<string, number>>
 }
 
-/** Read the telemetry file (absent/unreadable → empty stats). */
-export async function readStats(dir: string): Promise<MemoryStats> {
-  const text = await readMemoryFile(dir, STATS_FILE)
-  if (text === undefined) return { entries: {}, ignored: {} }
+const EMPTY_STATS_META = { version: 1, windowStartedAt: '' }
+/** Read the telemetry file (absent/unreadable → empty stats with a fresh window start). */
+export async function readStats(dir: string, fileName = DEFAULT_STATS_FILE): Promise<MemoryStats> {
+  const text = await readMemoryFile(dir, fileName)
+  if (text === undefined) {
+    // NOTE: never return a shared EMPTY_STATS-shaped object — its `entries`/
+    // `ignored` would be the SAME reference for every caller, so a writer
+    // mutating them would leak data across dirs (production bug found via
+    // tests: B dir read A dir's entries). Always fresh objects.
+    return { meta: { version: 1, windowStartedAt: new Date().toISOString() }, entries: {}, ignored: {} }
+  }
   try {
     const parsed = JSON.parse(text) as MemoryStats
+    const meta = typeof parsed.meta === 'object' && parsed.meta !== null && typeof parsed.meta.windowStartedAt === 'string'
+      ? { version: 1, windowStartedAt: parsed.meta.windowStartedAt }
+      : { ...EMPTY_STATS_META }
     return {
+      meta,
       entries: typeof parsed.entries === 'object' && parsed.entries !== null ? parsed.entries : {},
       ignored: typeof parsed.ignored === 'object' && parsed.ignored !== null ? parsed.ignored : {},
     }
   } catch {
-    return { entries: {}, ignored: {} }
+    // Corrupted file: fresh empty stats (fresh objects, see note above).
+    return { meta: { version: 1, windowStartedAt: new Date().toISOString() }, entries: {}, ignored: {} }
   }
 }
 
 /**
  * Record one hit for a knowledge entry (`file|title` key), bumping the
  * channel counter and last-hit timestamp. Serialized; never throws into the
- * caller (best-effort telemetry).
+ * caller (best-effort telemetry). Note: the key is a weakly-stable identity —
+ * renaming a title starts a new entry (accepted tradeoff, see the P0.5 spec).
  */
 export function recordEntryHit(
   dir: string,
   file: string,
   title: string,
   channel: HitChannel,
+  fileName = DEFAULT_STATS_FILE,
 ): Promise<void> {
   return serializedWrite(async () => {
     try {
-      const stats = await readStats(dir)
+      const stats = await readStats(dir, fileName)
       const key = `${file}|${title}`
       const entry = stats.entries[key] ?? { hits: 0, lastHit: '', channels: {} }
-      entry.hits += 1
+      // surfaced = exposure, not a true hit (review revision: never merged into hits)
+      if (channel !== 'surfaced') entry.hits += 1
       entry.lastHit = new Date().toISOString()
       entry.channels[channel] = (entry.channels[channel] ?? 0) + 1
       stats.entries[key] = entry
       await ensureMemoryDir(dir)
-      await atomicWriteFile(join(dir, STATS_FILE), JSON.stringify(stats, null, 2) + '\n')
+      await atomicWriteFile(join(dir, fileName), JSON.stringify(stats, null, 2) + '\n')
     } catch {
       // telemetry is best-effort — never break the caller
     }
@@ -573,13 +596,13 @@ export function recordEntryHit(
 }
 
 /** Record one ignore/degrade event by reason code. */
-export function recordIgnored(dir: string, reasonCode: string): Promise<void> {
+export function recordIgnored(dir: string, reasonCode: string, fileName = DEFAULT_STATS_FILE): Promise<void> {
   return serializedWrite(async () => {
     try {
-      const stats = await readStats(dir)
+      const stats = await readStats(dir, fileName)
       stats.ignored[reasonCode] = (stats.ignored[reasonCode] ?? 0) + 1
       await ensureMemoryDir(dir)
-      await atomicWriteFile(join(dir, STATS_FILE), JSON.stringify(stats, null, 2) + '\n')
+      await atomicWriteFile(join(dir, fileName), JSON.stringify(stats, null, 2) + '\n')
     } catch {
       // best-effort
     }
@@ -604,7 +627,13 @@ function entryTitlesAtLines(text: string, matchedLines: Set<number>): string[] {
 }
 
 /** Keyword grep across all memory files (Claude Code's grep-over-RAG stance). */
-export async function searchMemory(dir: string, query: string, label = '', channel: HitChannel = 'grep'): Promise<string> {
+export async function searchMemory(
+  dir: string,
+  query: string,
+  label = '',
+  channel: HitChannel = 'grep',
+  statsFile = DEFAULT_STATS_FILE,
+): Promise<string> {
   const needle = query.toLowerCase()
   const results: string[] = []
   const files = [INDEX_FILE, STATE_FILE, ARCHIVE_FILE, ...KNOWLEDGE_FILES]
@@ -628,7 +657,7 @@ export async function searchMemory(dir: string, query: string, label = '', chann
       // Awaited (not fire-and-forget) so tests can clean up deterministically.
       if (KNOWLEDGE_FILES.includes(file as never)) {
         for (const title of entryTitlesAtLines(text, matchedLines)) {
-          await recordEntryHit(dir, file, title, channel)
+          await recordEntryHit(dir, file, title, channel, statsFile)
         }
       }
     }
@@ -639,9 +668,10 @@ export async function searchMemory(dir: string, query: string, label = '', chann
   // mean total amnesia. The model can then recall the suggested entries.
   const hits = await fuzzySuggest(dir, query)
   if (hits.length > 0) {
-    // Telemetry: suggestions are 'suggest' channel (recommended, not read yet).
+    // Telemetry: fuzzy candidates are surfaced (exposure), not true hits
+    // (review revision: surfaced is never merged into hits).
     for (const hit of hits) {
-      await recordEntryHit(dir, hit.file, hit.title.replace(/\s*\(\d{4}-\d{2}-\d{2}\)$/, ''), 'suggest')
+      await recordEntryHit(dir, hit.file, hit.title.replace(/\s*\(\d{4}-\d{2}-\d{2}\)$/, ''), 'surfaced', statsFile)
     }
     return renderFuzzySuggestions(query, hits)
   }
@@ -810,12 +840,13 @@ export async function searchAcrossWorkspaces(
   userDir: string,
   currentDir: string,
   query: string,
+  statsFile = DEFAULT_STATS_FILE,
 ): Promise<string> {
   const workspaces = await listWorkspaces(userDir)
   const parts: string[] = []
   for (const entry of workspaces) {
     if (entry.path === currentDir) continue // 排除当前工作区
-    const text = await searchMemory(entry.path, query, `工作区<${entry.name}>/`, 'across')
+    const text = await searchMemory(entry.path, query, `工作区<${entry.name}>/`, 'across', statsFile)
     // 只丢弃裸失败（（无匹配：…）；fuzzy 候选以「（无精确匹配：…」开头，必须保留
     if (!text.startsWith('（无匹配：')) parts.push(text)
   }
@@ -1120,25 +1151,27 @@ export async function reportMemory(dir: string, maxAgeDays = 180): Promise<Memor
 }
 
 /** Render the audit report as model-facing text. */
-/** Render the telemetry summary: zero-hit entries (cleanup candidates) and top hits. */
+/** Render the telemetry summary: true hits vs surfaced exposure vs zero-hit cold signals. */
 export function renderTelemetrySummary(stats: MemoryStats): string[] {
   const lines: string[] = []
   const entries = Object.entries(stats.entries)
   if (entries.length === 0) return lines
-  const zeroHit = entries.filter(([, stat]) => stat.hits === 0)
-  const top = entries
-    .filter(([, stat]) => stat.hits > 0)
-    .sort((a, b) => b[1].hits - a[1].hits)
-    .slice(0, 3)
-  lines.push('', '📈 命中统计（stats.json）：')
-  lines.push(`- 有命中条目 ${entries.length - zeroHit.length} / ${entries.length}，总命中 ${entries.reduce((s, [, st]) => s + st.hits, 0)} 次`)
+  const withHits = entries.filter(([, stat]) => stat.hits > 0)
+  const withSurfaced = entries.filter(([, stat]) => (stat.channels.surfaced ?? 0) > 0)
+  const zeroHit = entries.filter(([, stat]) => stat.hits === 0 && (stat.channels.surfaced ?? 0) === 0)
+  const totalHits = withHits.reduce((s, [, st]) => s + st.hits, 0)
+  const totalSurfaced = withSurfaced.reduce((s, [, st]) => s + (st.channels.surfaced ?? 0), 0)
+  const windowStart = stats.meta.windowStartedAt === '' ? '' : stats.meta.windowStartedAt.slice(0, 10)
+  const top = withHits.sort((a, b) => b[1].hits - a[1].hits).slice(0, 3)
+  lines.push('', '📈 命中统计（stats.local.json，当前统计窗口' + (windowStart === '' ? '' : `自 ${windowStart} 起`) + '）：')
+  lines.push(`- 真命中 ${totalHits} 次（${withHits.length} 条）；曝光(surfaced) ${totalSurfaced} 次（${withSurfaced.length} 条）`)
   if (top.length > 0) {
     lines.push(`- 最热条目：${top.map(([key, st]) => `${key.split('|')[1] ?? key}(${st.hits}次)`).join('、')}`)
   }
   if (zeroHit.length > 0) {
-    lines.push(`- ⚠️ 从未被命中的条目 ${zeroHit.length} 条：`
+    lines.push(`- ⚠️ 当前统计窗口内未命中的条目 ${zeroHit.length} 条：`
       + `${zeroHit.slice(0, 5).map(([key]) => key.split('|')[1] ?? key).join('、')}${zeroHit.length > 5 ? '…' : ''}`
-      + '（compact 清理候选）')
+      + '（冷候选信号——需结合类别/年龄/近期编辑人工复核，不自动清理）')
   }
   const ignored = Object.entries(stats.ignored)
   if (ignored.length > 0) {
@@ -1682,6 +1715,8 @@ export interface MemoryToolConfig {
   userMemoryDir?: string
   /** Whether workspace writes register this project for cross-workspace lookup (default true). */
   crossWorkspace?: boolean
+  /** Whether telemetry writes to stats.json (git-committable) instead of stats.local.json (default false). */
+  commitTelemetry?: boolean
 }
 
 /** A minimal run context carrying the owning agent's session cwd. */
@@ -1697,6 +1732,9 @@ export interface MemoryToolExec {
 export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
   const { maxBytes, maxIndexLines, maxIndexBytes, crossWorkspace = true } = config
   const userDir = config.userMemoryDir ?? userMemoryDirOf()
+  // Telemetry file: stats.local.json by default (runtime data, not for git);
+  // stats.json only when the user opts into committing telemetry.
+  const statsFile = config.commitTelemetry ? STATS_FILE : DEFAULT_STATS_FILE
 
   // ── memory_recall ─────────────────────────────────────────────────────
   const memoryRecall = defineTool({
@@ -1762,7 +1800,7 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
         if (rawScope === 'across') {
           const query = typeof args.query === 'string' && args.query.trim() !== '' ? args.query.trim() : undefined
           if (query !== undefined) {
-            return { text: await searchAcrossWorkspaces(userDir, workspaceDir, query) }
+            return { text: await searchAcrossWorkspaces(userDir, workspaceDir, query, statsFile) }
           }
           return { text: renderWorkspaceRegistry(await listWorkspaces(userDir)) }
         }
@@ -1792,13 +1830,13 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
         const query = typeof args.query === 'string' && args.query.trim() !== '' ? args.query.trim() : undefined
         if (query !== undefined) {
           if (rawScope === 'all') {
-            const ws = await searchMemory(workspaceDir, query)
-            const us = await searchMemory(userDir, query, '用户级/')
+            const ws = await searchMemory(workspaceDir, query, '', 'grep', statsFile)
+            const us = await searchMemory(userDir, query, '用户级/', 'grep', statsFile)
             const parts = [ws, us].filter(text => !text.startsWith('（无匹配'))
             if (parts.length > 0) return { text: parts.join('\n\n') }
             return { text: `（无匹配：${query}）` }
           }
-          return { text: await searchMemory(dir, query) }
+          return { text: await searchMemory(dir, query, '', 'grep', statsFile) }
         }
         const category = typeof args.category === 'string' ? args.category : undefined
         if (category !== undefined) {
@@ -2024,7 +2062,7 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
           return { text: prefix + renderCompactOutcome(outcome), applied: true }
         }
         const report = await reportMemory(dir, maxAgeDays)
-        const stats = await readStats(dir)
+        const stats = await readStats(dir, statsFile)
         return { text: prefix + renderMemoryReport(report, maxAgeDays, stats), applied: false }
       })()
     },
