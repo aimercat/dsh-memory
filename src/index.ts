@@ -102,6 +102,12 @@ export interface Config {
   remindCooldownTurns: number
   /** Whether telemetry writes to stats.json (git-committable) instead of stats.local.json (default false). */
   commitTelemetry: boolean
+  /** High-water ratio for the pointer index (pressure reminder trigger, default 0.8). */
+  indexHighWaterRatio: number
+  /** Low-water ratio for the pointer index (recommended healthy target, default 0.6). */
+  indexLowWaterRatio: number
+  /** Cooldown for the pressure reminder: skip if reminded within N turns (default 5). */
+  pressureCooldownTurns: number
 }
 
 /** 插件配置 schema，供 Cordis loader 做校验与默认值注入。 */
@@ -117,12 +123,74 @@ export const Config = Schema.object({
   confirmStrikes: Schema.number().default(3).description('候选未确认的提醒暴露次数上限，达到后自动降级为仅日志（移入 archive）。'),
   remindCooldownTurns: Schema.number().default(5).description('空暂存提醒的冷却回合数：最近 N 个回合内提醒过则不再提示。'),
   commitTelemetry: Schema.boolean().default(false).description('命中统计写入 stats.json（可提交 git）而非 stats.local.json（默认，运行期本地数据）。'),
+  indexHighWaterRatio: Schema.number().default(0.8).description('索引高水位比例（压力提醒触发线）；校验 0<low<high<1，非法回退默认。'),
+  indexLowWaterRatio: Schema.number().default(0.6).description('索引低水位比例（推荐健康目标线，compact 结果评价线）。'),
+  pressureCooldownTurns: Schema.number().default(5).description('索引压力提醒冷却回合数；水位状态跨区变化时重置提醒资格。'),
 })
 
 /** One pointer row of the index digest. */
 export interface MemoryIndexRow {
   file: string
   summary: string
+}
+
+/** Watermark state of the pointer index (v1.1 P1: dual-threshold hysteresis). */
+export type WatermarkStatus = 'healthy' | 'pressure' | 'over'
+
+/** Computed watermark info for the index. */
+export interface WatermarkInfo {
+  lines: number
+  bytes: number
+  highLines: number
+  highBytes: number
+  lowLines: number
+  lowBytes: number
+  /** Worst of the two dimension ratios (lines/bytes), in [0, ∞). */
+  percent: number
+  status: WatermarkStatus
+}
+
+/**
+ * Normalize watermark ratios with validation: `0 < low < high < 1` else fall
+ * back to defaults (review revision: inverted/equal/out-of-range config must
+ * not silently disable the hysteresis mechanism).
+ */
+export function normalizeWatermarkRatios(
+  highRatio: number | undefined,
+  lowRatio: number | undefined,
+): { high: number; low: number } {
+  const high = typeof highRatio === 'number' && Number.isFinite(highRatio) && highRatio > 0 && highRatio < 1
+    ? highRatio
+    : 0.8
+  const low = typeof lowRatio === 'number' && Number.isFinite(lowRatio) && lowRatio > 0 && lowRatio < 1
+    ? lowRatio
+    : 0.6
+  return low < high ? { high, low } : { high: 0.8, low: 0.6 }
+}
+
+/** Compute the watermark state from both dimensions (either crossing triggers). */
+export function watermarkStatus(
+  lines: number,
+  bytes: number,
+  maxLines: number,
+  maxBytes: number,
+  highRatio = 0.8,
+  lowRatio = 0.6,
+): WatermarkInfo {
+  const linePercent = maxLines > 0 ? lines / maxLines : 0
+  const bytePercent = maxBytes > 0 ? bytes / maxBytes : 0
+  const percent = Math.max(linePercent, bytePercent)
+  const status: WatermarkStatus = percent >= 1 ? 'over' : percent >= highRatio ? 'pressure' : 'healthy'
+  return {
+    lines,
+    bytes,
+    highLines: Math.floor(maxLines * highRatio),
+    highBytes: Math.floor(maxBytes * highRatio),
+    lowLines: Math.floor(maxLines * lowRatio),
+    lowBytes: Math.floor(maxBytes * lowRatio),
+    percent,
+    status,
+  }
 }
 
 /** The composed memory context handed to the model. */
@@ -135,6 +203,8 @@ export interface MemoryContext {
   indexOverCap: boolean
   /** Byte budget actually applied. */
   budget: number
+  /** Watermark info (v1.1 P1), present when the index file was readable. */
+  watermark?: WatermarkInfo
 }
 
 /** Resolve the memory directory for a session cwd: `{projectRoot}/.dsh/memory`. */
@@ -211,10 +281,13 @@ export async function composeMemoryContext(
   maxBytes: number,
   maxIndexLines = DEFAULT_MAX_INDEX_LINES,
   maxIndexBytes = DEFAULT_MAX_INDEX_BYTES,
+  watermarkRatios?: { high: number; low: number },
 ): Promise<MemoryContext> {
   const rows: MemoryIndexRow[] = []
   let indexOverCap = false
   let injectedIndexBytes = 0
+  let totalIndexLines = 0
+  let totalIndexBytes = 0
   const indexText = await readMemoryFile(dir, INDEX_FILE)
   if (indexText !== undefined) {
     // Pointer-style rows: `- [Title](file.md) — summary` (one line each).
@@ -228,6 +301,8 @@ export async function composeMemoryContext(
         lineCount += 1
         const bytes = Buffer.byteLength(line, 'utf8')
         byteCount += bytes
+        totalIndexLines = lineCount
+        totalIndexBytes = byteCount
         if (lineCount <= maxIndexLines && byteCount <= maxIndexBytes) {
           rows.push({ file: match[2]!, summary: match[3]!.trim() || match[1]!.trim() })
           injectedIndexBytes += bytes
@@ -248,6 +323,11 @@ export async function composeMemoryContext(
   }
   const state = await readMemoryFile(dir, STATE_FILE)
   const context: MemoryContext = { index: rows, indexOverCap, budget: maxBytes }
+  // v1.1 P1: watermark over ALL pointer rows (not just the injected slice).
+  if (indexText !== undefined) {
+    const ratios = watermarkRatios ?? { high: 0.8, low: 0.6 }
+    context.watermark = watermarkStatus(totalIndexLines, totalIndexBytes, maxIndexLines, maxIndexBytes, ratios.high, ratios.low)
+  }
   // Dynamic budget: the index (the pointer block) takes priority and the
   // state digest gets whatever is left. When the index already consumes the
   // whole budget the state is skipped entirely instead of emitting a
@@ -307,12 +387,13 @@ export async function composeCombinedMemoryContext(
   maxBytes: number,
   maxIndexLines = DEFAULT_MAX_INDEX_LINES,
   maxIndexBytes = DEFAULT_MAX_INDEX_BYTES,
+  watermarkRatios?: { high: number; low: number },
 ): Promise<{ workspace: MemoryContext; user: MemoryContext | undefined }> {
   const workspaceBudget = Math.floor(maxBytes * 0.7)
-  const workspace = await composeMemoryContext(dir, workspaceBudget, maxIndexLines, maxIndexBytes)
+  const workspace = await composeMemoryContext(dir, workspaceBudget, maxIndexLines, maxIndexBytes, watermarkRatios)
   const user = userDir === undefined
     ? undefined
-    : await composeMemoryContext(userDir, maxBytes - workspaceBudget, maxIndexLines, maxIndexBytes)
+    : await composeMemoryContext(userDir, maxBytes - workspaceBudget, maxIndexLines, maxIndexBytes, watermarkRatios)
   return { workspace, user }
 }
 
@@ -1180,7 +1261,12 @@ export function renderTelemetrySummary(stats: MemoryStats): string[] {
   return lines
 }
 
-export function renderMemoryReport(report: MemoryReport, maxAgeDays: number, stats?: MemoryStats): string {
+export function renderMemoryReport(
+  report: MemoryReport,
+  maxAgeDays: number,
+  stats?: MemoryStats,
+  watermark?: WatermarkInfo,
+): string {
   const lines = ['📊 记忆概览（.dsh/memory/）：', '']
   for (const file of report.files) {
     const notes: string[] = [`${file.total} 条`]
@@ -1189,13 +1275,28 @@ export function renderMemoryReport(report: MemoryReport, maxAgeDays: number, sta
     if (file.stale > 0) notes.push(`${file.stale} 条陈旧(>${maxAgeDays}天)`)
     lines.push(`- ${file.name}：${notes.join('，')}`)
   }
-  lines.push('', `- 索引：${report.indexLines} 行 / ${report.indexBytes} B`
-    + `（上限 ${DEFAULT_MAX_INDEX_LINES} 行 / ${DEFAULT_MAX_INDEX_BYTES} B）`
-    + (report.indexOverCap ? ' ⚠️ 超限' : ' ✅'))
+  if (watermark !== undefined) {
+    // v1.1 P1: single-state watermark display (review revision — no parallel states).
+    const percent = Math.round(watermark.percent * 100)
+    const zone = watermark.status === 'over'
+      ? `超限（部分条目未加载）`
+      : watermark.status === 'pressure'
+        ? `压力区（建议 memory_compact 整理）`
+        : '健康'
+    lines.push('', `- 索引：${watermark.lines} 行 / ${watermark.bytes} B`
+      + `（上限 ${DEFAULT_MAX_INDEX_LINES} 行 / ${DEFAULT_MAX_INDEX_BYTES} B；`
+      + `高水位 ${watermark.highLines} 行 / ${watermark.highBytes} B；`
+      + `低水位 ${watermark.lowLines} 行 / ${watermark.lowBytes} B）`)
+    lines.push(`  当前：${percent}%（${zone}）`)
+  } else {
+    lines.push('', `- 索引：${report.indexLines} 行 / ${report.indexBytes} B`
+      + `（上限 ${DEFAULT_MAX_INDEX_LINES} 行 / ${DEFAULT_MAX_INDEX_BYTES} B）`
+      + (report.indexOverCap ? ' ⚠️ 超限' : ' ✅'))
+  }
   if (stats !== undefined) lines.push(...renderTelemetrySummary(stats))
   if (report.totalEntries === 0) lines.push('', '（暂无记忆条目。完成后用 memory_update 写入第一条经验吧。）')
   else lines.push('', '建议：用 memory_compact apply 合并重复并归档过期废弃条目；'
-    + '陈旧(>maxAgeDays)但仍有用的条目可手动精简正文；从未被命中的条目可考虑归档。')
+    + '陈旧(>maxAgeDays)但仍有用的条目可手动精简正文；当前统计窗口内未命中的冷候选可考虑归档。')
   return lines.join('\n')
 }
 
@@ -1207,6 +1308,10 @@ export interface CompactOutcome {
   archivedSuperseded: string[]
   /** Whether the pointer index was rebuilt. */
   indexRebuilt: boolean
+  /** Post-compact watermark (v1.1 P1), present when the index was readable. */
+  watermark?: WatermarkInfo
+  /** Cold candidates (window zero-hit) titles, for the explicit next-step advice. */
+  coldCandidates: string[]
 }
 
 /**
@@ -1216,7 +1321,11 @@ export interface CompactOutcome {
  * blocks land in `archive.md`. The whole pass runs in the serialized-write
  * queue so it cannot interleave with concurrent appends.
  */
-export function compactMemory(dir: string, maxAgeDays = 180): Promise<CompactOutcome> {
+export function compactMemory(
+  dir: string,
+  maxAgeDays = 180,
+  watermarkRatios?: { high: number; low: number },
+): Promise<CompactOutcome> {
   return serializedWrite(async () => {
     const merged: string[] = []
     const archivedSuperseded: string[] = []
@@ -1259,7 +1368,30 @@ export function compactMemory(dir: string, maxAgeDays = 180): Promise<CompactOut
       await rebuildIndex(dir)
       indexRebuilt = true
     }
-    return { merged, archivedSuperseded, indexRebuilt }
+    // v1.1 P1: post-compact watermark + cold candidates for explicit advice.
+    const indexText = await readMemoryFile(dir, INDEX_FILE)
+    let watermark: WatermarkInfo | undefined
+    if (indexText !== undefined) {
+      let lines = 0
+      let bytes = 0
+      for (const line of indexText.split('\n')) {
+        if (/^- \[.+?\]\(<[^>]+\.md>\)/.test(line.trim())) {
+          lines += 1
+          bytes += Buffer.byteLength(line, 'utf8')
+        }
+      }
+      const ratios = watermarkRatios ?? { high: 0.8, low: 0.6 }
+      watermark = watermarkStatus(lines, bytes, DEFAULT_MAX_INDEX_LINES, DEFAULT_MAX_INDEX_BYTES, ratios.high, ratios.low)
+    }
+    let coldCandidates: string[] = []
+    try {
+      const stats = await readStats(dir)
+      coldCandidates = Object.entries(stats.entries)
+        .filter(([, st]) => st.hits === 0 && (st.channels.surfaced ?? 0) === 0)
+        .map(([key]) => key.split('|')[1] ?? key)
+        .slice(0, 5)
+    } catch { /* best-effort */ }
+    return { merged, archivedSuperseded, indexRebuilt, watermark, coldCandidates }
   })
 }
 
@@ -1271,6 +1403,25 @@ export function renderCompactOutcome(outcome: CompactOutcome): string {
   lines.push(`- 归档过期废弃 ${outcome.archivedSuperseded.length} 条（>整理阈值，移入 archive.md）`)
   for (const item of outcome.archivedSuperseded) lines.push(`  - ${item}`)
   lines.push(`- 索引重建：${outcome.indexRebuilt ? '是' : '无需变更（无条目被移动）'}`)
+  // v1.1 P1: post-compact watermark verdict with explicit next steps (review revision).
+  if (outcome.watermark !== undefined) {
+    const percent = Math.round(outcome.watermark.percent * 100)
+    if (outcome.watermark.status === 'healthy') {
+      lines.push('', `✅ 索引已回到健康区（水位 ${percent}%，低水位线 ${outcome.watermark.lowLines} 行 / ${outcome.watermark.lowBytes} B）`)
+    } else if (outcome.watermark.status === 'pressure') {
+      lines.push('', `⚠️ 索引仍处于压力区（水位 ${percent}%，未到低水位）。建议：`)
+      if (outcome.coldCandidates.length > 0) {
+        lines.push(`  - 优先归档统计窗口内冷候选（当前 ${outcome.coldCandidates.length} 条：${outcome.coldCandidates.join('、')}）`)
+      }
+      lines.push('  - 合并重复主题 / 缩短 index 行描述 / 正文过长则拆分主题文件')
+    } else {
+      lines.push('', `❌ 索引仍超限（水位 ${percent}%）。现有合并/归档不足以降水位，需人工：`)
+      lines.push('  - 精简 index 文本或拆分 topic/file')
+      if (outcome.coldCandidates.length > 0) {
+        lines.push(`  - 冷候选：${outcome.coldCandidates.join('、')}`)
+      }
+    }
+  }
   lines.push('', '归档条目保留在 archive.md 中，可手动恢复；如需永久删除请直接编辑文件。')
   return lines.join('\n')
 }
@@ -1553,6 +1704,9 @@ const lastInjectedTurns = new Map<string, number>()
 /** Cooldown state for the empty-staging reminder (sessionId → last remind turn). */
 const lastEmptyRemind = new Map<string, { lastTurn: number; count: number }>()
 
+/** Pressure-reminder cooldown state (agentId → last remind turn + status). */
+const lastPressureRemind = new Map<string, { lastTurn: number; status: WatermarkStatus }>()
+
 export function apply(ctx: Context, config: Config): void {
   const {
     maxBytes,
@@ -1565,7 +1719,12 @@ export function apply(ctx: Context, config: Config): void {
     inlineConfirm,
     confirmStrikes,
     remindCooldownTurns,
+    indexHighWaterRatio,
+    indexLowWaterRatio,
+    pressureCooldownTurns,
+    commitTelemetry,
   } = config
+  const statsFile = commitTelemetry ? STATS_FILE : DEFAULT_STATS_FILE
 
   // ── turn-boundary injection ──────────────────────────────────────────
   // Fold a bounded memory digest into the FIRST pre-step of each turn, right
@@ -1592,9 +1751,32 @@ export function apply(ctx: Context, config: Config): void {
     if (cwd === undefined) return decision
     const dir = await memoryDirOf(cwd)
     const userDir = userMemory ? userMemoryDirOf() : undefined
-    const combined = await composeCombinedMemoryContext(dir, userDir, maxBytes, maxIndexLines, maxIndexBytes)
-    const text = renderCombinedMemoryContext(combined.workspace, combined.user)
+    const ratios = normalizeWatermarkRatios(indexHighWaterRatio, indexLowWaterRatio)
+    const combined = await composeCombinedMemoryContext(dir, userDir, maxBytes, maxIndexLines, maxIndexBytes, ratios)
+    let text = renderCombinedMemoryContext(combined.workspace, combined.user)
     if (text === '') return decision
+    // v1.1 P1: pressure reminder — only when the workspace index is in the
+    // pressure/over zone, with cooldown + status-change reset (review revision).
+    const watermark = combined.workspace.watermark
+    if (watermark !== undefined && watermark.status !== 'healthy') {
+      const prev = lastPressureRemind.get(agent.id)
+      const statusChanged = prev === undefined || prev.status !== watermark.status
+      const cooldownHit = prev !== undefined && !statusChanged && turn - prev.lastTurn < pressureCooldownTurns
+      if (!cooldownHit || statusChanged) {
+        lastPressureRemind.set(agent.id, { lastTurn: turn, status: watermark.status })
+        const percent = Math.round(watermark.percent * 100)
+        let coldHint = ''
+        if (watermark.status !== 'over') {
+          try {
+            const stats = await readStats(dir, statsFile)
+            const cold = Object.entries(stats.entries).filter(([, st]) => st.hits === 0 && (st.channels.surfaced ?? 0) === 0).length
+            if (cold > 0) coldHint = `；当前统计窗口内有 ${cold} 条冷候选可供优先整理`
+          } catch { /* best-effort */ }
+        }
+        const zone = watermark.status === 'over' ? '超限（部分条目未加载）' : `压力区（水位 ${percent}%）`
+        text += `\n\n> ⚠️ 记忆索引处于${zone}，建议运行 memory_compact report/apply 整理${coldHint}。`
+      }
+    }
     lastInjectedTurns.set(agent.id, turn)
     const block: UserMessageLike = {
       id: randomUUID(),
@@ -1717,6 +1899,10 @@ export interface MemoryToolConfig {
   crossWorkspace?: boolean
   /** Whether telemetry writes to stats.json (git-committable) instead of stats.local.json (default false). */
   commitTelemetry?: boolean
+  /** High-water ratio (default 0.8). */
+  indexHighWaterRatio?: number
+  /** Low-water ratio (default 0.6). */
+  indexLowWaterRatio?: number
 }
 
 /** A minimal run context carrying the owning agent's session cwd. */
@@ -1730,7 +1916,14 @@ export interface MemoryToolExec {
  * action branching, path traversal guard) with a fake exec context.
  */
 export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
-  const { maxBytes, maxIndexLines, maxIndexBytes, crossWorkspace = true } = config
+  const {
+    maxBytes,
+    maxIndexLines,
+    maxIndexBytes,
+    crossWorkspace = true,
+    indexHighWaterRatio,
+    indexLowWaterRatio,
+  } = config
   const userDir = config.userMemoryDir ?? userMemoryDirOf()
   // Telemetry file: stats.local.json by default (runtime data, not for git);
   // stats.json only when the user opts into committing telemetry.
@@ -2058,12 +2251,19 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
         const dir = scope === 'user' ? userDir : await memoryDirOf(cwd)
         const prefix = scope === 'user' ? '（作用域：用户级记忆 ~/.dsh/memory/）\n\n' : ''
         if (action === 'apply') {
-          const outcome = await compactMemory(dir, maxAgeDays)
+          const ratios = normalizeWatermarkRatios(indexHighWaterRatio, indexLowWaterRatio)
+          const outcome = await compactMemory(dir, maxAgeDays, ratios)
           return { text: prefix + renderCompactOutcome(outcome), applied: true }
         }
         const report = await reportMemory(dir, maxAgeDays)
         const stats = await readStats(dir, statsFile)
-        return { text: prefix + renderMemoryReport(report, maxAgeDays, stats), applied: false }
+        const ratios = normalizeWatermarkRatios(indexHighWaterRatio, indexLowWaterRatio)
+        const watermark = watermarkStatus(
+          report.indexLines, report.indexBytes,
+          DEFAULT_MAX_INDEX_LINES, DEFAULT_MAX_INDEX_BYTES,
+          ratios.high, ratios.low,
+        )
+        return { text: prefix + renderMemoryReport(report, maxAgeDays, stats, watermark), applied: false }
       })()
     },
     presentCall: args => ({ card: 'generic', title: 'Compact workspace memory', kind: 'other', rawInput: args }),
