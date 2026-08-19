@@ -101,6 +101,13 @@ Copy-Item "<repo-path>\preset\memory" "$env:USERPROFILE\.dsh\.agent-presets\memo
 | `turnEndReminder` | `true` | 每回合结束是否提示 Agent 考虑写入记忆 |
 | `userMemory` | `true` | 是否启用用户级记忆（~/.dsh/memory/）并注入其索引 |
 | `crossWorkspace` | `true` | 是否将本工作区登记进跨工作区检索注册表（敏感项目请关闭） |
+| `inlineConfirm` | `true` | 内联确认流：回合结束提炼 ≤3 条候选立即确认/忽略；false 恢复旧版提醒 |
+| `confirmStrikes` | `3` | 候选未确认的提醒暴露次数上限，达到后自动降级为仅日志 |
+| `remindCooldownTurns` | `5` | 空暂存提醒冷却回合数 |
+| `commitTelemetry` | `false` | 命中统计写 stats.json（可提交）而非 stats.local.json（默认本地） |
+| `indexHighWaterRatio` | `0.8` | 索引高水位比例（压力提醒触发线；校验 0<low<high<1） |
+| `indexLowWaterRatio` | `0.6` | 索引低水位比例（推荐健康目标线，compact 结果评价线） |
+| `pressureCooldownTurns` | `5` | 索引压力提醒冷却回合数；水位状态跨区变化重置资格 |
 
 ## 开发
 
