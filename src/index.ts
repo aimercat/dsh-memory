@@ -108,6 +108,8 @@ export interface Config {
   indexLowWaterRatio: number
   /** Cooldown for the pressure reminder: skip if reminded within N turns (default 5). */
   pressureCooldownTurns: number
+  /** Cross-workspace search cap (default 5; 0 disables across search). */
+  acrossMaxWorkspaces: number
 }
 
 /** 插件配置 schema，供 Cordis loader 做校验与默认值注入。 */
@@ -126,6 +128,7 @@ export const Config = Schema.object({
   indexHighWaterRatio: Schema.number().default(0.8).description('索引高水位比例（压力提醒触发线）；校验 0<low<high<1，非法回退默认。'),
   indexLowWaterRatio: Schema.number().default(0.6).description('索引低水位比例（推荐健康目标线，compact 结果评价线）。'),
   pressureCooldownTurns: Schema.number().default(5).description('索引压力提醒冷却回合数；水位状态跨区变化时重置提醒资格。'),
+  acrossMaxWorkspaces: Schema.number().default(5).description('跨工作区检索上限（0 = 禁用检索；登记顺序为过渡排序，长期升级最近活跃优先）。'),
 })
 
 /** One pointer row of the index digest. */
@@ -361,6 +364,7 @@ const MEMORY_DISCIPLINE =
   + '如需查阅完整记忆或写入新经验，调用 memory_recall / memory_update / memory_state 工具。'
   + '完成非平凡工作后应把经验写入记忆，使其跨会话存活。'
   + '用户级记忆（~/.dsh/memory/）记录个人偏好与跨项目通用经验；项目知识请写入工作区记忆。'
+  + '跨工作区记忆默认低置信（不套用别区决策/命令/路径）；普通检索不自动跨区，仅显式 scope=across 时使用。'
 
 export function renderMemoryContext(context: MemoryContext): string {
   const lines: string[] = []
@@ -912,27 +916,46 @@ export function registerWorkspace(userDir: string, memoryDir: string): Promise<v
   })
 }
 
+/** Low-confidence discipline for cross-workspace results (v1.1 P2, review revision). */
+export const ACROSS_LOW_CONFIDENCE =
+  '以下为跨工作区检索结果，默认低置信——仅当任务明确与该项目相关时参考，行动前以真实文件为准。'
+  + '不要把别的工作区中的项目决策、命名约定、路径结构、工具命令直接套用到当前工作区，仅视作「可能相关经验」。'
+
 /**
- * Search every registered workspace EXCEPT the current one. Results carry a
- * `工作区<name>/` source label so the model always knows the knowledge is not
- * from the current project (联想按需、来源标注、永不进常驻注入).
+ * Search registered workspaces EXCEPT the current one, capped at
+ * `maxWorkspaces` (transition ordering: registration order; long-term
+ * upgrade to recent-activity first). Results carry a `工作区<name>/` source
+ * label plus the low-confidence prefix (联想按需、来源标注、低置信、永不进常驻注入).
+ * `maxWorkspaces <= 0` disables cross-workspace search entirely.
  */
 export async function searchAcrossWorkspaces(
   userDir: string,
   currentDir: string,
   query: string,
+  maxWorkspaces = 5,
   statsFile = DEFAULT_STATS_FILE,
 ): Promise<string> {
+  if (maxWorkspaces <= 0) {
+    return `（跨工作区检索已禁用（acrossMaxWorkspaces=${maxWorkspaces}））`
+  }
   const workspaces = await listWorkspaces(userDir)
+  const candidates = workspaces.filter(entry => entry.path !== currentDir) // 排除当前工作区
+  const searched = candidates.slice(0, maxWorkspaces)
+  const skipped = candidates.length - searched.length
   const parts: string[] = []
-  for (const entry of workspaces) {
-    if (entry.path === currentDir) continue // 排除当前工作区
+  for (const entry of searched) {
     const text = await searchMemory(entry.path, query, `工作区<${entry.name}>/`, 'across', statsFile)
     // 只丢弃裸失败（（无匹配：…）；fuzzy 候选以「（无精确匹配：…」开头，必须保留
     if (!text.startsWith('（无匹配：')) parts.push(text)
   }
-  if (parts.length === 0) return `（跨工作区无匹配：${query}。已注册 ${workspaces.length} 个工作区。）`
-  return parts.join('\n\n')
+  const header = [ACROSS_LOW_CONFIDENCE]
+  if (skipped > 0) {
+    header.push(`（已检索 ${searched.length} 个工作区，另有 ${skipped} 个未检索——上限 acrossMaxWorkspaces=${maxWorkspaces}）`)
+  }
+  if (parts.length === 0) {
+    return `${header.join('\n')}\n\n（跨工作区无匹配：${query}。已注册 ${workspaces.length} 个工作区。）`
+  }
+  return `${header.join('\n')}\n\n${parts.join('\n\n')}`
 }
 
 /** Render the registry listing for the model (scope=across without query). */
@@ -942,7 +965,8 @@ export function renderWorkspaceRegistry(entries: WorkspaceEntry[]): string {
   }
   const lines = ['🌐 已注册工作区（scope=across 可检索，排除当前工作区）：', '']
   for (const entry of entries) lines.push(`- ${entry.name}：${entry.path}`)
-  lines.push('', '用法：memory_recall 传 scope="across" + query 在其他工作区的记忆中搜索。')
+  lines.push('', ACROSS_LOW_CONFIDENCE)
+  lines.push('', '用法：memory_recall 传 scope="across" + query 在其他工作区的记忆中搜索（显式触发，普通检索不自动跨区）。')
   return lines.join('\n')
 }
 
@@ -1723,6 +1747,7 @@ export function apply(ctx: Context, config: Config): void {
     indexLowWaterRatio,
     pressureCooldownTurns,
     commitTelemetry,
+    acrossMaxWorkspaces,
   } = config
   const statsFile = commitTelemetry ? STATS_FILE : DEFAULT_STATS_FILE
 
@@ -1903,6 +1928,8 @@ export interface MemoryToolConfig {
   indexHighWaterRatio?: number
   /** Low-water ratio (default 0.6). */
   indexLowWaterRatio?: number
+  /** Cross-workspace search cap (default 5; 0 disables across search). */
+  acrossMaxWorkspaces?: number
 }
 
 /** A minimal run context carrying the owning agent's session cwd. */
@@ -1923,6 +1950,7 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
     crossWorkspace = true,
     indexHighWaterRatio,
     indexLowWaterRatio,
+    acrossMaxWorkspaces = 5,
   } = config
   const userDir = config.userMemoryDir ?? userMemoryDirOf()
   // Telemetry file: stats.local.json by default (runtime data, not for git);
@@ -1960,8 +1988,14 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
           + 'user: the user-level ~/.dsh/memory (personal preferences, cross-project experience). '
           + 'all: both layers, user results labeled as such. '
           + 'across: search other REGISTERED workspaces (workspaces.md) — explicit '
-          + 'cross-project recall, results carry a 工作区<name>/ source label; '
-          + 'current workspace is excluded.',
+          + 'cross-project recall, results carry a 工作区<name>/ source label and are '
+          + 'default low-confidence (do NOT apply other projects decisions/commands/paths); '
+          + 'current workspace is excluded; capped by maxWorkspaces.',
+      },
+      maxWorkspaces: {
+        type: 'number',
+        description: 'Across-search workspace cap (default from config acrossMaxWorkspaces; '
+          + '0 disables cross-workspace search). Only applies to scope=across.',
       },
     },
     output: {
@@ -1992,8 +2026,11 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
         const workspaceDir = await memoryDirOf(cwd)
         if (rawScope === 'across') {
           const query = typeof args.query === 'string' && args.query.trim() !== '' ? args.query.trim() : undefined
+          const maxWorkspaces = typeof args.maxWorkspaces === 'number' && Number.isFinite(args.maxWorkspaces)
+            ? Math.max(0, Math.floor(args.maxWorkspaces))
+            : acrossMaxWorkspaces
           if (query !== undefined) {
-            return { text: await searchAcrossWorkspaces(userDir, workspaceDir, query, statsFile) }
+            return { text: await searchAcrossWorkspaces(userDir, workspaceDir, query, maxWorkspaces, statsFile) }
           }
           return { text: renderWorkspaceRegistry(await listWorkspaces(userDir)) }
         }
