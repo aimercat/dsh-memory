@@ -110,6 +110,10 @@ export interface Config {
   pressureCooldownTurns: number
   /** Cross-workspace search cap (default 5; 0 disables across search). */
   acrossMaxWorkspaces: number
+  /** Session-level injection dedup by content hash (default true). */
+  dedupeInjection: boolean
+  /** Force a re-injection after N consecutive skips (default 20; guards long-session context loss). */
+  dedupeRefreshTurns: number
 }
 
 /** 插件配置 schema，供 Cordis loader 做校验与默认值注入。 */
@@ -129,6 +133,8 @@ export const Config = Schema.object({
   indexLowWaterRatio: Schema.number().default(0.6).description('索引低水位比例（推荐健康目标线，compact 结果评价线）。'),
   pressureCooldownTurns: Schema.number().default(5).description('索引压力提醒冷却回合数；水位状态跨区变化时重置提醒资格。'),
   acrossMaxWorkspaces: Schema.number().default(5).description('跨工作区检索上限（0 = 禁用检索；登记顺序为过渡排序，长期升级最近活跃优先）。'),
+  dedupeInjection: Schema.boolean().default(true).description('会话级注入去重：内容哈希不变则跳过重复注入（省 token + KV 缓存友好）。'),
+  dedupeRefreshTurns: Schema.number().default(20).description('连续跳过注入 N 次后强制重注入（防长会话上下文截断后失忆）。'),
 })
 
 /** One pointer row of the index digest. */
@@ -1731,6 +1737,54 @@ const lastEmptyRemind = new Map<string, { lastTurn: number; count: number }>()
 /** Pressure-reminder cooldown state (agentId → last remind turn + status). */
 const lastPressureRemind = new Map<string, { lastTurn: number; status: WatermarkStatus }>()
 
+// ── session-level injection dedup (v1.2 P0) ───────────────────────────────
+// The digest is injected once per turn today; across turns the content is
+// usually unchanged, so a session-level content hash skips identical
+// re-injection (token saving + KV-cache-friendly stable prefix). A forced
+// refresh after `dedupeRefreshTurns` consecutive skips guards against long
+// sessions where the earlier injected text left the effective context
+// (truncation/compaction). Cache key = sessionId|agentId (review revision).
+
+/** FNV-1a 64-bit as a 16-hex-char string (BigInt, dependency-free). */
+export function fnv1a64(text: string): string {
+  let hash = 0xcbf29ce484222325n
+  const prime = 0x100000001b3n
+  const mask = 0xffffffffffffffffn
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= BigInt(text.charCodeAt(i))
+    hash = (hash * prime) & mask
+  }
+  return hash.toString(16).padStart(16, '0')
+}
+
+interface InjectionCacheEntry {
+  hash: string
+  len: number
+  skipCount: number
+}
+
+const lastInjectedHash = new Map<string, InjectionCacheEntry>()
+
+/** Debug counters (review revision): observable via debug logs, not formal stats. */
+export const injectionDedupCounters = {
+  skipped: 0,
+  forcedRefresh: 0,
+}
+
+/** Dedup decision: inject (new/changed content), skip (identical, under refresh limit), or refresh (force re-inject). */
+export type InjectionDedupDecision = 'inject' | 'skip' | 'refresh'
+
+/** Pure dedup decision logic (testable without a Cordis context). */
+export function decideInjectionDedup(
+  cached: InjectionCacheEntry | undefined,
+  hash: string,
+  len: number,
+  refreshTurns: number,
+): InjectionDedupDecision {
+  if (cached === undefined || cached.hash !== hash || cached.len !== len) return 'inject'
+  return cached.skipCount < refreshTurns ? 'skip' : 'refresh'
+}
+
 export function apply(ctx: Context, config: Config): void {
   const {
     maxBytes,
@@ -1748,6 +1802,8 @@ export function apply(ctx: Context, config: Config): void {
     pressureCooldownTurns,
     commitTelemetry,
     acrossMaxWorkspaces,
+    dedupeInjection,
+    dedupeRefreshTurns,
   } = config
   const statsFile = commitTelemetry ? STATS_FILE : DEFAULT_STATS_FILE
 
@@ -1803,6 +1859,26 @@ export function apply(ctx: Context, config: Config): void {
       }
     }
     lastInjectedTurns.set(agent.id, turn)
+    // v1.2 P0: session-level content dedup — skip when the final text (stable
+    // baseline + volatile tail) is byte-identical to the last injected one.
+    if (dedupeInjection) {
+      const key = `${agent.session.id}|${agent.id}` // composite key (review revision)
+      const hash = fnv1a64(text)
+      const len = text.length
+      const cached = lastInjectedHash.get(key)
+      const dedupDecision = decideInjectionDedup(cached, hash, len, dedupeRefreshTurns)
+      if (dedupDecision === 'skip') {
+        injectionDedupCounters.skipped += 1
+        lastInjectedHash.set(key, { ...cached!, skipCount: cached!.skipCount + 1 })
+        ctx.logger.debug('[dsh-memory] injection skipped (unchanged, skip #%d)', cached!.skipCount + 1)
+        return decision // 模型上下文已有完全相同文本
+      }
+      if (dedupDecision === 'refresh') {
+        injectionDedupCounters.forcedRefresh += 1
+        ctx.logger.debug('[dsh-memory] injection forced refresh (skip limit %d)', dedupeRefreshTurns)
+      }
+      lastInjectedHash.set(key, { hash, len, skipCount: 0 })
+    }
     const block: UserMessageLike = {
       id: randomUUID(),
       role: 'user',
