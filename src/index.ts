@@ -369,6 +369,7 @@ const MEMORY_DISCIPLINE =
   '记忆纪律：记忆只是提示——行动前用真实文件核实。'
   + '如需查阅完整记忆或写入新经验，调用 memory_recall / memory_update / memory_state 工具。'
   + '完成非平凡工作后应把经验写入记忆，使其跨会话存活。'
+  + '会话状态变化（连接的服务/配置的改动/验证的结论等）也要用 memory_state 更新"当前进度"，让新会话能恢复上下文。'
   + '用户级记忆（~/.dsh/memory/）记录个人偏好与跨项目通用经验；项目知识请写入工作区记忆。'
   + '跨工作区记忆默认低置信（不套用别区决策/命令/路径）；普通检索不自动跨区，仅显式 scope=across 时使用。'
 
@@ -1921,7 +1922,9 @@ export function apply(ctx: Context, config: Config): void {
               content: [{ type: 'text', text:
                 '本回合已结束。如果本回合产生了值得跨会话保留的经验（架构决策/代码模式/排查经验/用户偏好），'
                 + '请在下一回合用 memory_update 或 memory_state 工具写入工作区记忆（.dsh/memory/）。'
-                + '判断标准：解决新问题、发现模式、做决策、踩坑——否则无需写入。' }],
+                + '判断标准：解决新问题、发现模式、做决策、踩坑——否则无需写入。'
+                + '同时：如果本回合改变了会话状态（连接的服务、改动的配置、验证结论等），'
+                + '请用 memory_state 更新"当前进度"，让新会话能恢复上下文。' }],
               source: { kind: 'dsh-memory' as never },
             }
             entry.inbox.prepend('next-step', legacy as never)
@@ -1968,7 +1971,9 @@ export function apply(ctx: Context, config: Config): void {
             content: [{ type: 'text', text:
               '本回合已结束。若本回合产生了高价值经验（架构决策 / 排障经验优先，≤3 条），'
               + '请用 memory_state 写入经验暂存区（格式 `- [ ] category: title — body`），并立即用 memory_confirm 内联确认归档——不要留到下次会话。'
-              + 'pattern 次优先；user 类偏好请写用户级记忆（scope=user）。' }],
+              + 'pattern 次优先；user 类偏好请写用户级记忆（scope=user）。'
+              + '另外：若本回合改变了会话状态（连接的服务 / 改动的配置 / 验证结论等），'
+              + '请用 memory_state 更新"当前进度"，让新会话能恢复上下文。' }],
             source: { kind: 'dsh-memory' as never },
           }
           entry.inbox.prepend('next-step', reminder as never)
@@ -2269,7 +2274,9 @@ export function createMemoryTools(config: MemoryToolConfig): ToolDefinition[] {
     description:
       'Update the workspace state file (.dsh/memory/state.md) — current progress, '
       + 'last-session state, or staged experience. Use at session boundaries: update '
-      + '"当前进度" as you make progress, update "上次会话状态" at the end of a session, '
+      + '"当前进度" as you make progress AND whenever the session state changes '
+      + '(services connected, config edited, verification concluded — the next session '
+      + 'recovers context from it), update "上次会话状态" at the end of a session, '
       + 'and stage non-trivial experience under "经验暂存" for user confirmation '
       + '(the next session surfaces it before archiving into a knowledge file). '
       + 'Staging format — one entry per line: "- [ ] {category}: {title}[ — {body}]", '
